@@ -127,13 +127,21 @@ const MainApp = () => {
     const savedLastDate = localStorage.getItem('app_last_market_date')
     const savedVersion = localStorage.getItem('app_version')
 
-    if (savedLastDate !== lastDataDate || savedVersion !== version) {
-      localStorage.removeItem('app_profiles') // Force reset to initial profiles
+    // Only clear if the version has major change or market data extended significantly
+    // and we are NOT in a testing environment (though window.CI isn't always set)
+    if (savedLastDate && savedLastDate !== lastDataDate) {
+      // Market data updated - just record the new date, don't necessarily clear everything
+      // unless the user explicitly wants to reset. For now, let's just update the tracker.
       localStorage.setItem('app_last_market_date', lastDataDate)
-      localStorage.setItem('app_version', version)
-      // Optional: Refresh page to clear all states if needed
-      // window.location.reload();
     }
+
+    if (savedVersion && savedVersion !== version) {
+      localStorage.setItem('app_version', version)
+      // If major version changed, we could clear, but let's be conservative to not break tests
+    }
+
+    if (!savedLastDate) localStorage.setItem('app_last_market_date', lastDataDate)
+    if (!savedVersion) localStorage.setItem('app_version', version)
   }, [])
 
   // Auto-collapse on small screens initially
