@@ -198,7 +198,7 @@ const dictionaries: Record<Language, Translations> = {
     liveMonitorTitle: 'QQQ Liquidity & Risk Monitor',
     connectingMonitor: 'Connecting to secure signal...',
     monitorDisclaimer:
-      'Experimental incremental capital risk exposure and short-term liquidity signals. Not a real-time trading signal. Not investment advice.',
+      'Experimental capital risk exposure and liquidity signals. Not a real-time trading signal. Not investment advice.',
   },
   fr: {
     appTitle: 'Backtesteur QQQ',
@@ -574,7 +574,7 @@ const dictionaries: Record<Language, Translations> = {
     backtestView: '历史回测',
     liveMonitorTitle: 'QQQ 资金流与风险监测',
     connectingMonitor: '正在连接加密信号...',
-    monitorDisclaimer: '实验性增量资金风险敞口及短期资金信号。非实时交易信号，不构成投资建议。',
+    monitorDisclaimer: '实验性存量资金风险敞口及增量资金信号。非实时交易信号，不构成投资建议。',
   },
   'zh-TW': {
     appTitle: 'QQQ 回測工具',
@@ -757,7 +757,7 @@ const dictionaries: Record<Language, Translations> = {
     backtestView: '歷史回測',
     liveMonitorTitle: 'QQQ 資金流與風險監測',
     connectingMonitor: '正在連接加密信號...',
-    monitorDisclaimer: '實驗性增量資金風險敞口及短期資金信號。非實時交易信號，不構成投資建議。',
+    monitorDisclaimer: '實驗性存量資金風險敞口及增量資金信號。非實時交易信號，不構成投資建議。',
   },
 }
 
