@@ -97,18 +97,22 @@ export const FinancialReportModal: React.FC<FinancialReportModalProps> = ({ resu
                           {t('assets')}
                         </h4>
                         <div className="space-y-2 text-sm">
-                          <div className="flex justify-between">
-                            <span className="text-slate-600">
-                              QQQ ({state.shares.QQQ.toFixed(1)} {t('shares')})
-                            </span>
-                            <span className="font-mono font-medium">{fmt(qqqVal)}</span>
-                          </div>
-                          <div className="flex justify-between">
-                            <span className="text-slate-600">
-                              QLD ({state.shares.QLD.toFixed(1)} {t('shares')})
-                            </span>
-                            <span className="font-mono font-medium">{fmt(qldVal)}</span>
-                          </div>
+                          {Object.entries(state.shares).map(([ticker, shares]) => {
+                            if (shares < 0.001) return null
+                            const price =
+                              MARKET_DATA.find((m) => m.date === state.date)?.[`${ticker.toLowerCase()}Close` as keyof typeof MARKET_DATA[0]] ??
+                              MARKET_DATA.find((m) => m.date === state.date)?.customPrices?.[ticker] ??
+                              0
+                            const val = shares * Number(price)
+                            return (
+                              <div key={ticker} className="flex justify-between">
+                                <span className="text-slate-600">
+                                  {ticker} ({shares.toFixed(1)} {t('shares')})
+                                </span>
+                                <span className="font-mono font-medium">{fmt(val)}</span>
+                              </div>
+                            )
+                          })}
                           <div className="flex justify-between">
                             <span className="text-slate-600">{t('cash')}</span>
                             <span className="font-mono font-medium text-green-600">
@@ -181,6 +185,26 @@ export const FinancialReportModal: React.FC<FinancialReportModalProps> = ({ resu
                                 {evt.type === 'TRADE' && (
                                   <span className="bg-slate-100 text-slate-600 px-1.5 rounded font-bold text-[10px] min-w-[40px] text-center">
                                     TRADE
+                                  </span>
+                                )}
+                                {evt.type === 'ROTATION_IN' && (
+                                  <span className="bg-purple-100 text-purple-700 px-1.5 rounded font-bold text-[10px] min-w-[40px] text-center">
+                                    ROT IN
+                                  </span>
+                                )}
+                                {evt.type === 'ROTATION_OUT' && (
+                                  <span className="bg-purple-100 text-purple-700 px-1.5 rounded font-bold text-[10px] min-w-[40px] text-center">
+                                    ROT OUT
+                                  </span>
+                                )}
+                                {evt.type === 'PLEDGE_BORROW' && (
+                                  <span className="bg-orange-100 text-orange-700 px-1.5 rounded font-bold text-[10px] min-w-[40px] text-center">
+                                    P BORROW
+                                  </span>
+                                )}
+                                {evt.type === 'PLEDGE_REPAY' && (
+                                  <span className="bg-green-100 text-green-700 px-1.5 rounded font-bold text-[10px] min-w-[40px] text-center">
+                                    P REPAY
                                   </span>
                                 )}
                                 {evt.type === 'INTEREST_INC' && (

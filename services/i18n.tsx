@@ -56,6 +56,14 @@ const dictionaries: Record<Language, Translations> = {
     strat_flex1: 'Flex Rebalance (Defensive)',
     strat_flex2: 'Flex Rebalance (Aggressive)',
     strat_dipBuying: 'Dip Buying (5-State)',
+    strat_bearRotation: 'Bear Market Rotation', // PRD B1
+    strat_bearPledge: 'Bear Market Pledge', // PRD B2
+    // Bear Strategy Config Labels (PRD B)
+    bearRotation_tripleETF: '3x ETF Ticker',
+    bearRotation_enableAlerts: 'Enable Trade Alerts',
+    bearPledge_buyTarget: 'Buy Target Ticker',
+    bearPledge_maxPledgeRatio: 'Max Pledge Ratio (%)',
+    bearPledge_enableAlerts: 'Enable Operation Alerts',
     // Leverage
     stockPledge: 'Asset Pledge',
     loanRate: 'Loan Rate %',
@@ -474,6 +482,13 @@ const dictionaries: Record<Language, Translations> = {
     strat_flex1: '弹性再平衡-1 (防守)',
     strat_flex2: '弹性再平衡-2 (进取)',
     strat_dipBuying: '回调加仓 (五档状态机)',
+    strat_bearRotation: '熊市仓位转换型', // PRD B1
+    strat_bearPledge: '熊市质押借款型', // PRD B2
+    bearRotation_tripleETF: '3倍杠杆ETF代码',
+    bearRotation_enableAlerts: '启用交易推送',
+    bearPledge_buyTarget: '买入标的代码',
+    bearPledge_maxPledgeRatio: '最大质押比例 (%)',
+    bearPledge_enableAlerts: '启用操作推送',
     stockPledge: '资产质押融资',
     loanRate: '贷款利率 %',
     maxLtv: '清算线 LTV %',
@@ -674,6 +689,13 @@ const dictionaries: Record<Language, Translations> = {
     strat_flex1: '彈性再平衡-1 (防守)',
     strat_flex2: '彈性再平衡-2 (進取)',
     strat_dipBuying: '回調加倉 (五檔狀態機)',
+    strat_bearRotation: '熊市倉位轉換型', // PRD B1
+    strat_bearPledge: '熊市質押借款型', // PRD B2
+    bearRotation_tripleETF: '3倍槓桿ETF代碼',
+    bearRotation_enableAlerts: '啟用交易推送',
+    bearPledge_buyTarget: '買入標的代碼',
+    bearPledge_maxPledgeRatio: '最大質押比例 (%)',
+    bearPledge_enableAlerts: '啟用操作推送',
     stockPledge: '資產質押融資',
     loanRate: '貸款利率 %',
     maxLtv: '清算線 LTV %',

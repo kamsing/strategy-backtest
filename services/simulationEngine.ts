@@ -5,6 +5,7 @@ import {
   SimulationResult,
   StrategyFunction,
   FinancialEvent,
+  getShareValue,
 } from '../types'
 import {
   calculateCAGR,
@@ -17,6 +18,98 @@ import {
   calculateUlcerIndex,
 } from './financeMath'
 
+/**
+ * 从市场数据行中获取指定标的的收盘价
+ * 支持 QQQ、QLD 及任意自定义标的（通过 customPrices）
+ */
+export const getTickerClose = (dataRow: MarketDataRow, ticker: string): number => {
+  if (ticker === 'QQQ') return dataRow.qqqClose
+  if (ticker === 'QLD') return dataRow.qldClose
+  // 多标的 Record（PRD A1）
+  if (dataRow.customPrices?.[ticker]) return dataRow.customPrices[ticker]
+  // 向下兼容旧单标的字段
+  if (dataRow.customClose && dataRow.customClose > 0) return dataRow.customClose
+  return 0
+}
+
+/**
+ * 从市场数据行中获取指定标的的低价（用于保证金评估）
+ */
+export const getTickerLow = (dataRow: MarketDataRow, ticker: string): number => {
+  if (ticker === 'QQQ') return dataRow.qqqLow
+  if (ticker === 'QLD') return dataRow.qldLow
+  // 多标的 Record（PRD A1）
+  if (dataRow.customLows?.[ticker]) return dataRow.customLows[ticker]
+  // 向下兼容旧单标的字段
+  if (dataRow.customLow && dataRow.customLow > 0) return dataRow.customLow
+  return 0
+}
+
+/**
+ * 计算组合总资产市值（动态遍历所有持仓标的）
+ * 使用收盘价估值（用于策略计算）
+ */
+export const calcTotalAssets = (
+  shares: Record<string, number>,
+  cashBalance: number,
+  dataRow: MarketDataRow,
+): number => {
+  let total = cashBalance
+  for (const [ticker, qty] of Object.entries(shares)) {
+    if (qty > 0) {
+      const price = getTickerClose(dataRow, ticker)
+      total += qty * price
+    }
+  }
+  return total
+}
+
+/**
+ * 计算组合总资产市值（使用低价，用于保证金评估）
+ */
+export const calcTotalAssetsLow = (
+  shares: Record<string, number>,
+  cashBalance: number,
+  dataRow: MarketDataRow,
+): number => {
+  let total = cashBalance
+  for (const [ticker, qty] of Object.entries(shares)) {
+    if (qty > 0) {
+      const price = getTickerLow(dataRow, ticker)
+      total += qty * price
+    }
+  }
+  return total
+}
+
+/**
+ * 计算组合 Beta（相对 QQQ）
+ * QQQ leverageMultiplier=1, QLD=2, TQQQ/自定义3倍=3
+ */
+const calcBeta = (
+  shares: Record<string, number>,
+  dataRow: MarketDataRow,
+  netEquity: number,
+): number => {
+  if (netEquity <= 0) return 0
+  const leverageMap: Record<string, number> = {
+    QQQ: 1,
+    QLD: 2,
+    TQQQ: 3,
+  }
+  let betaWeightedSum = 0
+  for (const [ticker, qty] of Object.entries(shares)) {
+    if (qty > 0) {
+      const price = getTickerLow(dataRow, ticker)
+      const val = qty * price
+      // TQQQ 已在 leverageMap，其他自定义标的默认按1倍计算
+      const lev = leverageMap[ticker] ?? 1
+      betaWeightedSum += val * lev
+    }
+  }
+  return betaWeightedSum / netEquity
+}
+
 export const runBacktest = (
   marketData: MarketDataRow[],
   strategyFunc: StrategyFunction,
@@ -26,10 +119,10 @@ export const runBacktest = (
 ): SimulationResult => {
   const history: PortfolioState[] = []
 
-  // Initial empty state
+  // 初始空仓状态（shares 使用 Record 支持任意标的）
   let currentState: PortfolioState = {
     date: marketData[0].date,
-    shares: { QQQ: 0, QLD: 0, CUSTOM: 0 }, // 初始化三标的持仓
+    shares: { QQQ: 0, QLD: 0, CUSTOM: 0 }, // 保留 CUSTOM 向下兼容
     cashBalance: 0,
     debtBalance: 0,
     accruedInterest: 0,
@@ -42,7 +135,7 @@ export const runBacktest = (
 
   const monthlyCashYieldRate = Math.pow(1 + config.cashYieldAnnual / 100, 1 / 12) - 1
 
-  // Debt settings
+  // 债务配置
   const leverage = {
     ...config.leverage,
     qqqPledgeRatio: config.leverage?.qqqPledgeRatio ?? 0.7,
@@ -75,9 +168,9 @@ export const runBacktest = (
       continue
     }
 
-    // 1. Banking Logic: Interest Accrual & Debt Service
+    // 1. 银行计息：现金利息收入 & 债务利息计算
     if (index > 0) {
-      // Step A: Accrue Interest on Cash
+      // Step A: 现金利息收入
       const interestEarned = currentState.cashBalance * monthlyCashYieldRate
       if (interestEarned > 0.01) {
         currentState.cashBalance += interestEarned
@@ -88,21 +181,19 @@ export const runBacktest = (
         })
       }
 
-      // Step B: Calculate Interest Due on Debt
+      // Step B: 计算债务利息
       let interestDue = 0
       if (leverage.enabled && currentState.debtBalance > 0) {
         interestDue = currentState.debtBalance * monthlyLoanRate
       }
 
-      // Step C: Service the Debt
-      // Step C: Service the Debt
+      // Step C: 处理债务利息（三种模式）
       if (interestDue > 0) {
-        const interestType = leverage.interestType || 'CAPITALIZED' // Default to Capitalized (Compound) behavior
+        const interestType = leverage.interestType || 'CAPITALIZED'
 
         if (interestType === 'MONTHLY') {
-          // --- EXISTING BEHAVIOR: Pay from Cash, Capitalize shortfall ---
+          // 按月现金支付，不足时资本化
           if (currentState.cashBalance >= interestDue) {
-            // Scenario: Liquidity Sufficient
             currentState.cashBalance -= interestDue
             monthEvents.push({
               type: 'INTEREST_EXP',
@@ -110,10 +201,8 @@ export const runBacktest = (
               description: `Loan Interest Paid by Cash`,
             })
           } else {
-            // Scenario: Liquidity Crunch
             const paidByCash = currentState.cashBalance
             const shortfall = interestDue - currentState.cashBalance
-
             if (paidByCash > 0) {
               monthEvents.push({
                 type: 'INTEREST_EXP',
@@ -121,7 +210,6 @@ export const runBacktest = (
                 description: `Loan Interest Paid by Cash (Partial)`,
               })
             }
-
             currentState.cashBalance = 0
             currentState.debtBalance += shortfall
             monthEvents.push({
@@ -131,15 +219,15 @@ export const runBacktest = (
             })
           }
         } else if (interestType === 'MATURITY') {
-          // --- NEW: Simple Interest, Accrue Separately ---
+          // 到期支付：计入应计利息，不复利
           currentState.accruedInterest += interestDue
           monthEvents.push({
             type: 'INTEREST_EXP',
-            amount: 0, // No cash flow
+            amount: 0,
             description: `Interest Accrued (Not Paid)`,
           })
         } else if (interestType === 'CAPITALIZED') {
-          // --- NEW: Compound Interest, Add to Principal ---
+          // 复利资本化
           currentState.debtBalance += interestDue
           monthEvents.push({
             type: 'DEBT_INC',
@@ -150,60 +238,45 @@ export const runBacktest = (
       }
     }
 
-    // 2. Execute Investment Strategy
-    // Capture "Deposits" implicitly by checking if cash increased mysteriously before trading?
-    // Actually, strategies usually add cash then buy.
-    // Let's rely on diffing shares/cash after strategy execution.
-
-    // Snapshot before strategy
+    // 2. 执行投资策略
     const cashBeforeStrat = currentState.cashBalance
     const sharesBeforeStrat = { ...currentState.shares }
 
+    // Clear events so strategy can push its own custom events for this month
+    currentState.events = []
     currentState = strategyFunc(currentState, dataRow, config, index)
 
-    // Detect Trades
-    const qqqDiff = currentState.shares.QQQ - sharesBeforeStrat.QQQ
-    const qldDiff = currentState.shares.QLD - sharesBeforeStrat.QLD
-
-    // Estimate cost based on close price (trade execution price)
-    if (Math.abs(qqqDiff) > 0.001) {
-      const cost = qqqDiff * dataRow.qqqClose
-      monthEvents.push({
-        type: 'TRADE',
-        amount: -cost,
-        description: `${qqqDiff > 0 ? 'Buy' : 'Sell'} ${Math.abs(qqqDiff).toFixed(2)} QQQ @ ${dataRow.qqqClose.toFixed(2)}`,
-      })
-    }
-    if (Math.abs(qldDiff) > 0.001) {
-      const cost = qldDiff * dataRow.qldClose
-      monthEvents.push({
-        type: 'TRADE',
-        amount: -cost,
-        description: `${qldDiff > 0 ? 'Buy' : 'Sell'} ${Math.abs(qldDiff).toFixed(2)} QLD @ ${dataRow.qldClose.toFixed(2)}`,
-      })
-    }
-    // 检测自定义标的（CUSTOM）的交易
-    const customDiff = currentState.shares.CUSTOM - sharesBeforeStrat.CUSTOM
-    if (Math.abs(customDiff) > 0.001 && dataRow.customClose && dataRow.customClose > 0) {
-      const customSymbol = 'CUSTOM'
-      const cost = customDiff * dataRow.customClose
-      monthEvents.push({
-        type: 'TRADE',
-        amount: -cost,
-        description: `${customDiff > 0 ? 'Buy' : 'Sell'} ${Math.abs(customDiff).toFixed(2)} ${customSymbol} @ ${dataRow.customClose.toFixed(2)}`,
-      })
+    // 检测交易（通过持仓变化推断）
+    for (const ticker of new Set([
+      ...Object.keys(sharesBeforeStrat),
+      ...Object.keys(currentState.shares),
+    ])) {
+      const before = sharesBeforeStrat[ticker] ?? 0
+      const after = currentState.shares[ticker] ?? 0
+      const diff = after - before
+      if (Math.abs(diff) > 0.001) {
+        const price = getTickerClose(dataRow, ticker)
+        if (price > 0) {
+          const cost = diff * price
+          monthEvents.push({
+            type: 'TRADE',
+            amount: -cost,
+            description: `${diff > 0 ? 'Buy' : 'Sell'} ${Math.abs(diff).toFixed(2)} ${ticker} @ ${price.toFixed(2)}`,
+          })
+        }
+      }
     }
 
-    // 检测DCA入金（近似：若买股后现金未按全额减少，差额为外部入金）
-    // 净交易成本 = QQQ+QLD+CUSTOM 三者买入成本之和
-    const customTradeCost =
-      dataRow.customClose && dataRow.customClose > 0
-        ? customDiff * dataRow.customClose
-        : 0
-    const netTradeCost = qqqDiff * dataRow.qqqClose + qldDiff * dataRow.qldClose + customTradeCost
+    // 检测 DCA 入金（近似：买入后现金变化 > 净交易成本，差额为外部资金流入）
+    let netTradeCost = 0
+    for (const ticker of Object.keys(currentState.shares)) {
+      const before = sharesBeforeStrat[ticker] ?? 0
+      const after = currentState.shares[ticker] ?? 0
+      const diff = after - before
+      const price = getTickerClose(dataRow, ticker)
+      netTradeCost += diff * price
+    }
     const impliedCashFlow = currentState.cashBalance - cashBeforeStrat + netTradeCost
-
-    // 浮点误差容忍值
     if (impliedCashFlow > 1.0) {
       monthEvents.push({
         type: 'DEPOSIT',
@@ -212,28 +285,37 @@ export const runBacktest = (
       })
     }
 
-    // 3. Leverage / Pledging Logic (Borrowing & Risk Check)
+    // 3. 杠杆/质押逻辑（借款、提取 & 偿债检查）
     if (leverage.enabled) {
       const currentMonth = parseInt(dataRow.date.substring(5, 7)) - 1
 
-      // Use LOW prices for conservative valuation (margin call assessment)
-      // 自定义标的低价估値（用于保证金评估）
-      const customLowVal =
-        dataRow.customLow && dataRow.customLow > 0
-          ? (currentState.shares.CUSTOM ?? 0) * dataRow.customLow
-          : 0
-      const qqqValue = currentState.shares.QQQ * dataRow.qqqLow
-      const qldValue = currentState.shares.QLD * dataRow.qldLow
+      // 使用低价进行保证金评估
+      const qqqValue = getShareValue(currentState.shares, 'QQQ', dataRow.qqqLow)
+      const qldValue = getShareValue(currentState.shares, 'QLD', dataRow.qldLow)
       const cashValue = currentState.cashBalance
-      const totalAssetValue = qqqValue + qldValue + customLowVal + cashValue
+
+      // 计算自定义标的总市值（低价）
+      let customAssetsLowValue = 0
+      for (const [ticker, qty] of Object.entries(currentState.shares)) {
+        if (ticker !== 'QQQ' && ticker !== 'QLD' && ticker !== 'CUSTOM' && qty > 0) {
+          const price = getTickerLow(dataRow, ticker)
+          customAssetsLowValue += qty * price
+        }
+      }
+      // 向下兼容旧 CUSTOM 单标的
+      const legacyCustomLow = dataRow.customLow && dataRow.customLow > 0
+        ? (currentState.shares['CUSTOM'] ?? 0) * dataRow.customLow
+        : 0
+      customAssetsLowValue += legacyCustomLow
+
+      const totalAssetValue = qqqValue + qldValue + customAssetsLowValue + cashValue
 
       const effectiveCollateral =
         qqqValue * leverage.qqqPledgeRatio +
         cashValue * leverage.cashPledgeRatio +
         qldValue * leverage.qldPledgeRatio
 
-      // Withdrawal Logic: Trigger on the very first month (Index 0) OR every January
-      // Previously: if (currentMonth === 0 && index > 0 && effectiveCollateral > 0)
+      // 年度提取（首月 or 每年1月）
       const isWithdrawalTiming = index === 0 || currentMonth === 0
 
       if (isWithdrawalTiming && effectiveCollateral > 0) {
@@ -241,11 +323,6 @@ export const runBacktest = (
         if (leverage.withdrawType === 'PERCENT') {
           borrowAmount = totalAssetValue * (leverage.withdrawValue / 100)
         } else {
-          // Fixed Amount withdrawal with Inflation adjustment
-          // Formula: Borrow = InitialFixed * (1 + inflation)^n
-          // n = Years passed.
-          // Index 0 (Month 1, Year 1) -> n=0 -> Base Amount
-          // Index 12 (Month 1, Year 2) -> n=1 -> Base * (1+inf)
           const yearsPassed = Math.floor(index / 12)
           const inflationFactor = Math.pow(1 + (leverage.inflationRate || 0) / 100, yearsPassed)
           borrowAmount = leverage.withdrawValue * inflationFactor
@@ -256,8 +333,7 @@ export const runBacktest = (
           monthEvents.push({
             type: 'WITHDRAW',
             amount: -borrowAmount,
-            description:
-              index === 0 ? `Initial Loan Withdrawal` : `Annual Living Expense Withdrawal`,
+            description: index === 0 ? `Initial Loan Withdrawal` : `Annual Living Expense Withdrawal`,
           })
           monthEvents.push({
             type: 'DEBT_INC',
@@ -267,22 +343,18 @@ export const runBacktest = (
         }
       }
 
-      // Solvency Check
+      // 偿债能力检查（LTV）
       if (effectiveCollateral > 0) {
         const totalLiability = currentState.debtBalance + currentState.accruedInterest
         const ltvDenominator =
           leverage.ltvBasis === 'COLLATERAL' ? effectiveCollateral : totalAssetValue
-
-        // If basis is Collateral, we divide by Effective Collateral.
-        // If basis is Total Assets, we divide by Total Assets.
 
         currentState.ltv = ltvDenominator > 0 ? (totalLiability / ltvDenominator) * 100 : 9999
       } else {
         currentState.ltv = currentState.debtBalance + currentState.accruedInterest > 0 ? 9999 : 0
       }
 
-      // Trigger Bankruptcy if Debt exceeds the safety limit (maxLtv) of the Collateral
-      // Example: maxLtv is 100%. If Debt > Collateral Value, game over.
+      // 触发爆仓
       if (currentState.ltv > leverage.maxLtv) {
         isBankrupt = true
         bankruptcyDate = dataRow.date
@@ -294,8 +366,7 @@ export const runBacktest = (
       }
     }
 
-    // New: Check for Negative Cash Bankruptcy
-    // If cash balance is negative (with small epsilon for float errors), backtest fails.
+    // 现金余额为负时触发爆仓
     if (!isBankrupt && currentState.cashBalance < -0.01) {
       isBankrupt = true
       bankruptcyDate = dataRow.date
@@ -306,43 +377,40 @@ export const runBacktest = (
       })
     }
 
-    // 4. Update Net Value & Risk Metrics
+    // 4. 净值更新（使用低价保守估值）
     if (!isBankrupt) {
-      // 低价估値用于静态中的净资产计算
-      const qqqVal = currentState.shares.QQQ * dataRow.qqqLow
-      const qldVal = currentState.shares.QLD * dataRow.qldLow
-      const customLowVal2 =
-        dataRow.customLow && dataRow.customLow > 0
-          ? (currentState.shares.CUSTOM ?? 0) * dataRow.customLow
+      const totalAssetsLow = calcTotalAssetsLow(
+        currentState.shares,
+        currentState.cashBalance,
+        dataRow,
+      )
+      // 向下兼容：加上旧 CUSTOM 单标的的低价估值
+      // （已在 calcTotalAssetsLow 中处理 CUSTOM key，但旧数据 customLow 字段需额外兼容）
+      const legacyCustomVal =
+        dataRow.customLow && dataRow.customLow > 0 && !dataRow.customLows
+          ? (currentState.shares['CUSTOM'] ?? 0) * dataRow.customLow
           : 0
-      const cashVal = currentState.cashBalance
+      const assets = totalAssetsLow + legacyCustomVal
 
-      const assets = qqqVal + qldVal + customLowVal2 + cashVal
-      // 净权益 = 资产 - 本金债务 - 未付利息
       currentState.totalValue = Math.max(
         0,
         assets - currentState.debtBalance - currentState.accruedInterest,
       )
 
-      // 计算 Beta（QQQ=1, Cash=0, QLD=2, CUSTOM=参考QQQ）
-      // CUSTOM 暂按 Beta=1 计算（无杂指数ETF假设）
-      if (currentState.totalValue > 0) {
-        currentState.beta = (qqqVal * 1 + qldVal * 2 + customLowVal2 * 1) / currentState.totalValue
-      } else {
-        currentState.beta = 0
-      }
+      // Beta 计算（PRD：TQQQ leverageMultiplier=3）
+      currentState.beta = calcBeta(currentState.shares, dataRow, currentState.totalValue)
     }
 
-    // 5. Record History
+    // 5. 记录历史
     history.push({
       ...currentState,
       shares: { ...currentState.shares },
       strategyMemory: { ...currentState.strategyMemory },
-      events: monthEvents, // Store the logs
+      events: [...monthEvents, ...(currentState.events || [])],
     })
   }
 
-  // Calculate Metrics
+  // 计算绩效指标
   const years = marketData.length / 12
   const finalState = history[history.length - 1]
   const initialInv = config.initialCapital

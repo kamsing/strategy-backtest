@@ -113,6 +113,8 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
     { value: 'FLEXIBLE_1', label: t('strat_flex1') },
     { value: 'FLEXIBLE_2', label: t('strat_flex2') },
     { value: 'DIP_BUYING_STATE', label: t('strat_dipBuying') },
+    { value: 'BEAR_ROTATION', label: t('strat_bearRotation') }, // PRD B1
+    { value: 'BEAR_PLEDGE', label: t('strat_bearPledge') }, // PRD B2
   ]
 
   const getStrategyLabel = (type: string) => {
@@ -498,6 +500,95 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
                   </div>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* PRD B1：熊市仓位转换策略专属配置 */}
+          {profile.strategyType === 'BEAR_ROTATION' && (
+            <div className="pt-2 border-t border-red-100 flex flex-col gap-3 bg-red-50/40 rounded-lg p-3">
+              <h4 className="text-[10px] font-bold text-red-500 uppercase tracking-wider">
+                🐻 Bear Rotation Config
+              </h4>
+              <div>
+                <label className="text-[10px] text-slate-500 uppercase font-bold mb-1 block">
+                  {t('bearRotation_tripleETF')}
+                </label>
+                <input
+                  type="text"
+                  value={profile.config.bearRotation?.tripleETF ?? 'TQQQ'}
+                  onChange={(e) =>
+                    updateProfile(profile.id, {
+                      bearRotation: {
+                        tripleETF: e.target.value.toUpperCase().trim(),
+                        enableAlerts: profile.config.bearRotation?.enableAlerts ?? true,
+                      },
+                    })
+                  }
+                  placeholder="TQQQ"
+                  maxLength={10}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm font-mono uppercase outline-none focus:ring-2 focus:ring-red-400"
+                />
+                <p className="text-[10px] text-slate-400 mt-1">
+                  下跌10/20/30/40% → 将 QQQ 持仓的对应比例换入3倍ETF，反弹时逐步换回
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* PRD B2：熊市质押借款策略专属配置 */}
+          {profile.strategyType === 'BEAR_PLEDGE' && (
+            <div className="pt-2 border-t border-orange-100 flex flex-col gap-3 bg-orange-50/40 rounded-lg p-3">
+              <h4 className="text-[10px] font-bold text-orange-500 uppercase tracking-wider">
+                🏛 Bear Pledge Config
+              </h4>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[10px] text-slate-500 uppercase font-bold mb-1 block">
+                    {t('bearPledge_buyTarget')}
+                  </label>
+                  <input
+                    type="text"
+                    value={profile.config.bearPledge?.buyTarget ?? 'QQQ'}
+                    onChange={(e) =>
+                      updateProfile(profile.id, {
+                        bearPledge: {
+                          buyTarget: e.target.value.toUpperCase().trim(),
+                          maxPledgeRatio: profile.config.bearPledge?.maxPledgeRatio ?? 0.1,
+                          enableAlerts: profile.config.bearPledge?.enableAlerts ?? true,
+                        },
+                      })
+                    }
+                    placeholder="QQQ"
+                    maxLength={10}
+                    className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-sm font-mono uppercase outline-none focus:ring-2 focus:ring-orange-400"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-slate-500 uppercase font-bold mb-1 block">
+                    {t('bearPledge_maxPledgeRatio')}
+                  </label>
+                  <input
+                    type="number"
+                    step="1"
+                    min="1"
+                    max="50"
+                    value={Math.round((profile.config.bearPledge?.maxPledgeRatio ?? 0.1) * 100)}
+                    onChange={(e) =>
+                      updateProfile(profile.id, {
+                        bearPledge: {
+                          buyTarget: profile.config.bearPledge?.buyTarget ?? 'QQQ',
+                          maxPledgeRatio: Number(e.target.value) / 100,
+                          enableAlerts: profile.config.bearPledge?.enableAlerts ?? true,
+                        },
+                      })
+                    }
+                    className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-orange-400"
+                  />
+                </div>
+              </div>
+              <p className="text-[10px] text-slate-400">
+                下跌10/20/30/40% → 每档借入总资产1%（最多{Math.round((profile.config.bearPledge?.maxPledgeRatio ?? 0.1) * 100)}%上限），买入{profile.config.bearPledge?.buyTarget ?? 'QQQ'}；反弹时分批卖出还款
+              </p>
             </div>
           )}
 

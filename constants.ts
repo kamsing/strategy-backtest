@@ -61,7 +61,7 @@ export const buildMarketDataWithCustom = (
         ...row,
         customClose: customItem.close,
         customLow: customItem.low,
-      }
+      } as MarketDataRow
     })
     .filter((row): row is MarketDataRow => row !== null)
 }

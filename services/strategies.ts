@@ -1,4 +1,5 @@
-import { AssetConfig, PortfolioState, StrategyFunction, StrategyType } from '../types'
+import { AssetConfig, PortfolioState, StrategyFunction, StrategyType, getShares } from '../types'
+import { getTickerClose } from './simulationEngine'
 
 interface CashAdequacyResult {
   isAdequate: boolean
@@ -51,7 +52,7 @@ const getContributionAllocation = (config: AssetConfig) => {
 export const strategyNoRebalance: StrategyFunction = (state, marketData, config, monthIndex) => {
   const isFirstMonth = monthIndex === 0
   // 确保 shares.CUSTOM 字段存在（向后兼容旧数据）
-  const newState = { ...state, date: marketData.date, shares: { ...state.shares, CUSTOM: state.shares.CUSTOM ?? 0 } }
+  const newState = { ...state, date: marketData.date, shares: { ...state.shares, CUSTOM: state.shares['CUSTOM'] ?? 0 } as Record<string, number> }
 
   // 判断是否有自定义标的以及是否有价格数据
   const hasCustom = (config.customWeight ?? 0) > 0 && marketData.customClose && marketData.customClose > 0
@@ -526,6 +527,327 @@ export const strategyDipBuyingState: StrategyFunction = (state, marketData, conf
   return newState
 }
 
+// ============================================================
+// 熊市策略共用的状态机内存结构（PRD B1/B2 共用）
+// ============================================================
+interface BearStrategyMemory extends StrategyMemory {
+  hwm?: number // High Water Mark（原型基金历史最高收盘价）
+  lwm?: number | null // Low Water Mark（从 HWM 下跌后的最低收盘价）
+  bearPhase?: number // 熊市阶段 0-4（0=正常，1=-10%，2=-20%，3=-30%，4=-40%）
+  recoveryPhase?: number // 反弹阶段 0-4（0=未反弹，1=+10%，2=+20%，3=+30%，4=+40%）
+  alertSent5pct?: boolean // 是否已发送 -5% 预警
+  mode?: 'normal' | 'bear' | 'recovery' // 当前策略模式
+  pledgeBudget?: number // B2：熊市质押借款上限（进入熊市时总资产快照的 maxPledgeRatio）
+  pledgeDebt?: number // B2：当前质押借款余额
+  pledgeBatches?: Array<{ ticker: string; qty: number; price: number; phase: number }> // B2：各批次买入记录
+}
+
+/**
+ * 共用工具：更新高水位/低水位，判断并返回当前熊市/反弹阶段
+ */
+const updateBearState = (
+  memory: BearStrategyMemory,
+  currentPrice: number,
+  isFirstMonth: boolean,
+): { bearPhase: number; recoveryPhase: number; mode: 'normal' | 'bear' | 'recovery'; bearPhaseChanged: boolean; recoveryPhaseChanged: boolean } => {
+  // 初始化
+  if (isFirstMonth || memory.hwm === undefined) {
+    memory.hwm = currentPrice
+    memory.lwm = null
+    memory.bearPhase = 0
+    memory.recoveryPhase = 0
+    memory.alertSent5pct = false
+    memory.mode = 'normal'
+  }
+
+  const prevBearPhase = memory.bearPhase ?? 0
+  const prevRecoveryPhase = memory.recoveryPhase ?? 0
+  const prevMode = memory.mode ?? 'normal'
+
+  // HWM 单调递增（仅在正常模式下更新）
+  if (prevMode === 'normal' && currentPrice > (memory.hwm ?? 0)) {
+    memory.hwm = currentPrice
+  }
+
+  const hwm = memory.hwm ?? currentPrice
+  const drawdown = (hwm - currentPrice) / hwm // 正值表示下跌幅度
+
+  let newBearPhase = prevBearPhase
+  let newRecoveryPhase = prevRecoveryPhase
+  let newMode = prevMode
+
+  if (prevMode !== 'recovery') {
+    // 熊市阶段判断（只增不减）
+    if (drawdown >= 0.40 && prevBearPhase < 4) newBearPhase = 4
+    else if (drawdown >= 0.30 && prevBearPhase < 3) newBearPhase = 3
+    else if (drawdown >= 0.20 && prevBearPhase < 2) newBearPhase = 2
+    else if (drawdown >= 0.10 && prevBearPhase < 1) newBearPhase = 1
+
+    if (newBearPhase > 0) {
+      newMode = 'bear'
+      // 追踪 LWM（进入熊市后记录最低价）
+      if (memory.lwm === null || memory.lwm === undefined) {
+        memory.lwm = currentPrice
+      } else if (currentPrice < memory.lwm) {
+        memory.lwm = currentPrice
+      }
+    }
+  }
+
+  // 从低点反弹判断（进入 recovery 模式）
+  const lwm = memory.lwm
+  if (prevMode === 'bear' && lwm !== null && lwm !== undefined && lwm > 0) {
+    const recovery = (currentPrice - lwm) / lwm
+    if (recovery >= 0.10) {
+      newMode = 'recovery'
+      // 反弹阶段（只增不减）
+      if (recovery >= 0.40 && prevRecoveryPhase < 4) newRecoveryPhase = 4
+      else if (recovery >= 0.30 && prevRecoveryPhase < 3) newRecoveryPhase = 3
+      else if (recovery >= 0.20 && prevRecoveryPhase < 2) newRecoveryPhase = 2
+      else if (recovery >= 0.10 && prevRecoveryPhase < 1) newRecoveryPhase = 1
+    }
+  } else if (prevMode === 'recovery' && lwm !== null && lwm !== undefined && lwm > 0) {
+    const recovery = (currentPrice - lwm) / lwm
+    // 反弹阶段继续递增
+    if (recovery >= 0.40 && prevRecoveryPhase < 4) newRecoveryPhase = 4
+    else if (recovery >= 0.30 && prevRecoveryPhase < 3) newRecoveryPhase = 3
+    else if (recovery >= 0.20 && prevRecoveryPhase < 2) newRecoveryPhase = 2
+    else if (recovery >= 0.10 && prevRecoveryPhase < 1) newRecoveryPhase = 1
+
+    // recoveryPhase=4 时完全恢复，回归 normal
+    if (newRecoveryPhase >= 4 && prevRecoveryPhase >= 4) {
+      newMode = 'normal'
+      memory.hwm = currentPrice // 更新 HWM
+      memory.lwm = null
+      newBearPhase = 0
+      newRecoveryPhase = 0
+    }
+  }
+
+  memory.bearPhase = newBearPhase
+  memory.recoveryPhase = newRecoveryPhase
+  memory.mode = newMode
+
+  return {
+    bearPhase: newBearPhase,
+    recoveryPhase: newRecoveryPhase,
+    mode: newMode,
+    bearPhaseChanged: newBearPhase !== prevBearPhase,
+    recoveryPhaseChanged: newRecoveryPhase !== prevRecoveryPhase,
+  }
+}
+
+/**
+ * Strategy: Bear Market Rotation (BEAR_ROTATION) - PRD B1
+ * 熊市仓位转换型：市场下跌时将原型基金转换为3倍ETF，反弹时逐步换回。
+ *
+ * 触发阈值（基于 QQQ HWM）：
+ * - 下跌10%→20%→30%→40%：依次将当前持仓的10%/20%/30%/40%转入3倍ETF
+ * - 反弹10%→20%→30%→40%：依次将3倍ETF的10%/20%/30%/40%换回原型基金
+ */
+export const strategyBearRotation: StrategyFunction = (state, marketData, config, monthIndex) => {
+  const isFirstMonth = monthIndex === 0
+  const memory = { ...(state.strategyMemory as unknown as BearStrategyMemory) }
+
+  // 先执行基础逻辑（定投）
+  const newState = strategyNoRebalance(state, marketData, config, monthIndex)
+
+  const currentPrice = marketData.qqqClose
+  const { bearPhase, recoveryPhase, bearPhaseChanged, recoveryPhaseChanged } =
+    updateBearState(memory, currentPrice, isFirstMonth)
+
+  // 确定3倍ETF标的（默认 TQQQ）
+  const tripleETF = config.bearRotation?.tripleETF ?? 'TQQQ'
+  const tripleETFPrice = getTickerClose(marketData, tripleETF)
+
+  if (!isFirstMonth && tripleETFPrice > 0) {
+    if (bearPhaseChanged && bearPhase > 0) {
+      // 按阶段比例将 QQQ 转入 3倍ETF
+      const rotateRatios: Record<number, number> = { 1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40 }
+      const ratio = rotateRatios[bearPhase] ?? 0
+      if (ratio > 0) {
+        const qqqQty = getShares(newState.shares, 'QQQ')
+        const sellQty = qqqQty * ratio
+        if (sellQty > 0.001) {
+          const sellValue = sellQty * marketData.qqqClose
+          const buyQty = sellValue / tripleETFPrice
+          newState.shares['QQQ'] = Math.max(0, qqqQty - sellQty)
+          newState.shares[tripleETF] = (newState.shares[tripleETF] ?? 0) + buyQty
+          memory.lastAction = `ROTATION_IN bearPhase=${bearPhase}: Sell ${sellQty.toFixed(2)} QQQ→${buyQty.toFixed(2)} ${tripleETF}`
+          
+          newState.events = newState.events || []
+          newState.events.push({
+            type: 'ROTATION_IN',
+            amount: sellValue,
+            description: `[Phase ${bearPhase}] Shifted ${sellQty.toFixed(2)} QQQ to ${buyQty.toFixed(2)} ${tripleETF}`,
+          })
+        }
+      }
+    }
+
+    if (recoveryPhaseChanged && recoveryPhase > 0) {
+      // 按阶段比例将 3倍ETF 换回 QQQ
+      const recoveryRatios: Record<number, number> = { 1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40 }
+      const ratio = recoveryRatios[recoveryPhase] ?? 0
+      if (ratio > 0) {
+        const tripleQty = getShares(newState.shares, tripleETF)
+        const sellQty = tripleQty * ratio
+        if (sellQty > 0.001) {
+          const sellValue = sellQty * tripleETFPrice
+          const buyQty = sellValue / marketData.qqqClose
+          newState.shares[tripleETF] = Math.max(0, tripleQty - sellQty)
+          newState.shares['QQQ'] = (newState.shares['QQQ'] ?? 0) + buyQty
+          memory.lastAction = `ROTATION_OUT recoveryPhase=${recoveryPhase}: Sell ${sellQty.toFixed(2)} ${tripleETF}→${buyQty.toFixed(2)} QQQ`
+          
+          newState.events = newState.events || []
+          newState.events.push({
+            type: 'ROTATION_OUT',
+            amount: sellValue,
+            description: `[Recovery ${recoveryPhase}] Restored ${sellQty.toFixed(2)} ${tripleETF} back to ${buyQty.toFixed(2)} QQQ`,
+          })
+        }
+      }
+    }
+  }
+
+  // 重新计算总价值
+  let total = newState.cashBalance
+  for (const [ticker, qty] of Object.entries(newState.shares)) {
+    if (qty > 0) {
+      const price = getTickerClose(marketData, ticker)
+      total += qty * price
+    }
+  }
+  newState.totalValue = total
+  newState.strategyMemory = memory
+  return newState
+}
+
+/**
+ * Strategy: Bear Market Pledge (BEAR_PLEDGE) - PRD B2
+ * 熊市质押借款型：市场下跌时质押借款分批买入指定基金，反弹时分批卖出还款。
+ *
+ * 触发阈值：
+ * - 下跌10%→20%→30%→40%：每档借入总资产净值的1%，买入指定基金
+ * - 反弹10%→20%→30%→40%：对应批次平仓10%/20%/30%/40%，卖出还款
+ */
+export const strategyBearPledge: StrategyFunction = (state, marketData, config, monthIndex) => {
+  const isFirstMonth = monthIndex === 0
+  const memory = { ...(state.strategyMemory as unknown as BearStrategyMemory) }
+
+  // 先执行基础逻辑（定投）
+  const newState = strategyNoRebalance(state, marketData, config, monthIndex)
+
+  const currentPrice = marketData.qqqClose
+  const { bearPhase, recoveryPhase, bearPhaseChanged, recoveryPhaseChanged } =
+    updateBearState(memory, currentPrice, isFirstMonth)
+
+  const buyTarget = config.bearPledge?.buyTarget ?? 'QQQ'
+  const maxPledgeRatio = config.bearPledge?.maxPledgeRatio ?? 0.10
+  const buyTargetPrice = getTickerClose(marketData, buyTarget)
+
+  if (!isFirstMonth && buyTargetPrice > 0) {
+    // 初始化质押借款上限（首次进入熊市时快照当前总资产）
+    if (bearPhaseChanged && bearPhase === 1) {
+      memory.pledgeBudget = newState.totalValue * maxPledgeRatio
+      memory.pledgeDebt = 0
+      memory.pledgeBatches = []
+    }
+
+    if (bearPhaseChanged && bearPhase > 0 && bearPhase <= 4) {
+      const budget = memory.pledgeBudget ?? 0
+      const currentDebt = memory.pledgeDebt ?? 0
+      // 每档借入总资产净值的1%（固定额度，不超过上限）
+      const borrowPerPhase = newState.totalValue * 0.01
+      const maxBorrow = budget - currentDebt
+      const actualBorrow = Math.min(borrowPerPhase, maxBorrow)
+
+      if (actualBorrow > 0.01) {
+        // 借款并买入
+        const buyQty = actualBorrow / buyTargetPrice
+        newState.shares[buyTarget] = (newState.shares[buyTarget] ?? 0) + buyQty
+        newState.debtBalance = (newState.debtBalance ?? 0) + actualBorrow
+        memory.pledgeDebt = currentDebt + actualBorrow
+
+        // 记录本批次买入
+        if (!memory.pledgeBatches) memory.pledgeBatches = []
+        memory.pledgeBatches.push({
+          ticker: buyTarget,
+          qty: buyQty,
+          price: buyTargetPrice,
+          phase: bearPhase,
+        })
+        memory.lastAction = `PLEDGE_BORROW bearPhase=${bearPhase}: Borrow $${actualBorrow.toFixed(0)}, Buy ${buyQty.toFixed(2)} ${buyTarget}`
+        
+        newState.events = newState.events || []
+        newState.events.push({
+          type: 'PLEDGE_BORROW',
+          amount: actualBorrow,
+          description: `[Phase ${bearPhase}] Pledged margin loan to buy ${buyQty.toFixed(2)} ${buyTarget}`,
+        })
+      }
+    }
+
+    if (recoveryPhaseChanged && recoveryPhase > 0 && (memory.pledgeBatches?.length ?? 0) > 0) {
+      // 按反弹阶段卖出对应批次的比例
+      const sellRatios: Record<number, number> = { 1: 0.10, 2: 0.20, 3: 0.30, 4: 1.00 }
+      const sellRatio = sellRatios[recoveryPhase] ?? 0
+
+      if (sellRatio > 0) {
+        // 先进先出：按照各批次平仓
+        let totalRepay = 0
+        const batches = memory.pledgeBatches ?? []
+        for (const batch of batches) {
+          const sellQty = batch.qty * sellRatio
+          const sellValue = sellQty * getTickerClose(marketData, batch.ticker)
+          const actualSell = Math.min(sellQty, getShares(newState.shares, batch.ticker))
+          if (actualSell > 0.001) {
+            const repayAmount = actualSell * getTickerClose(marketData, batch.ticker)
+            newState.shares[batch.ticker] = Math.max(
+              0,
+              (newState.shares[batch.ticker] ?? 0) - actualSell,
+            )
+            totalRepay += repayAmount
+          }
+          void sellValue // 抑制未使用变量警告
+        }
+
+        // 还款（优先偿还 debtBalance）
+        const repay = Math.min(totalRepay, newState.debtBalance)
+        newState.debtBalance = Math.max(0, newState.debtBalance - repay)
+        memory.pledgeDebt = Math.max(0, (memory.pledgeDebt ?? 0) - repay)
+
+        if (recoveryPhase >= 4) {
+          // 完全清零质押债务
+          memory.pledgeBatches = []
+          memory.pledgeDebt = 0
+          memory.pledgeBudget = 0
+        }
+        memory.lastAction = `PLEDGE_REPAY recoveryPhase=${recoveryPhase}: Repay $${repay.toFixed(0)}`
+        
+        newState.events = newState.events || []
+        newState.events.push({
+          type: 'PLEDGE_REPAY',
+          amount: repay,
+          description: `[Recovery ${recoveryPhase}] Sold positions to repay $${repay.toFixed(0)} margin loan`,
+        })
+      }
+    }
+  }
+
+  // 重新计算总价值
+  let total = newState.cashBalance
+  for (const [ticker, qty] of Object.entries(newState.shares)) {
+    if (qty > 0) {
+      const price = getTickerClose(marketData, ticker)
+      total += qty * price
+    }
+  }
+  newState.totalValue = total - (newState.debtBalance ?? 0)
+  newState.strategyMemory = memory
+  return newState
+}
+
 export const getStrategyByType = (type: StrategyType): StrategyFunction => {
   switch (type) {
     case 'NO_REBALANCE':
@@ -540,6 +862,10 @@ export const getStrategyByType = (type: StrategyType): StrategyFunction => {
       return strategyFlexible2
     case 'DIP_BUYING_STATE':
       return strategyDipBuyingState
+    case 'BEAR_ROTATION': // PRD B1
+      return strategyBearRotation
+    case 'BEAR_PLEDGE': // PRD B2
+      return strategyBearPledge
     default:
       return strategyNoRebalance
   }

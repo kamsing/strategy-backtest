@@ -1,0 +1,279 @@
+﻿
+
+
+
+CLEC Strategy Backtest
+功能扩展项目需求文档（PRD）
+新增标的管理 · 移动均线 · 价格图表 · 信号推送 · 两种熊市策略
+
+文档信息	
+版本	v1.0
+日期	2026-05-02
+目标受众	antigravity 开发团队
+文档状态	正式需求 · 待评审
+代码库	clec-strategy-backtest
+
+
+
+1. 项目背景与目标
+当前 CLEC Strategy Backtest 平台已实现 QQQ / QLD 两种资产的月度回测，支持 5 种投资策略、杠杆建模与 PDF 报告导出。
+本次迭代聚焦两大方向：
+A. 新增标的管理体系：支持用户自定义 3 倍杠杆基金（TQQQ、KORU 等），含仓位拖拽、移动均线、股价对比图及信号推送。
+B. 新增两种熊市策略：「熊市仓位转换型」与「熊市质押借款型」，实现基于回撤/反弹百分比的动态仓位管理。
+
+2. 术语约定
+术语	定义
+原型基金（Prototype Fund）	用户指定的1倍参考基金，默认 QQQ。用于衡量市场状态与计算回撤/反弹幅度。
+杠杆基金（Leveraged Fund）	2倍（如 QLD）或3倍（如 TQQQ）ETF，相对原型基金有杠杆放大效应。
+高水位（HWM）	原型基金自回测开始或上次重置以来的历史最高收盘价。
+低水位（LWM）	从高水位下跌后，原型基金历史最低收盘价（用于判断反弹）。
+回撤（Drawdown）	(HWM - 当前价) / HWM，触发卖出/转换/借款操作的关键指标。
+反弹（Recovery）	(当前价 - LWM) / LWM，触发平仓/回转操作的关键指标。
+自定义标的（CustomAsset）	用户在 UI 中手动新增的基金代码，可含历史数据 JSON。
+信号推送（Signal Alert）	当标的出现买入信号时，通过配置的消息渠道通知用户。
+
+
+3. 功能 A：新增标的管理体系
+3.1 自定义标的（A1）
+用户可在「配置面板 → 标的管理」中新增任意 ETF 代码（例如 TQQQ、KORU）。
+3.1.1 数据模型扩展
+在 types.ts 新增以下接口：
+interface CustomAsset {
+  id: string              // 唯一标识，如 'TQQQ'
+  ticker: string          // 股票代码，展示用
+  label: string           // 用户自定义显示名
+  leverageMultiplier: number  // 1 | 2 | 3
+  color: string           // 图表颜色
+  history: { month: string; close: number; low: number }[]
+}
+MarketDataRow 需扩展为动态 key-value 结构，以容纳自定义标的价格：
+// 现有固定字段保持不变，新增：
+customClose: Record<string, number>  // { 'TQQQ': 85.2, 'KORU': 12.4 }
+
+3.1.2 UI 交互流程
+入口：ConfigPanel → 「标的管理」标签页，列出当前所有标的（QQQ、QLD + 用户自定义）。
+新增标的：点击「+ 新增标的」，弹出 Modal 填写 Ticker、显示名、杠杆倍数、图表颜色，并上传/粘贴历史数据 JSON（格式与现有 qld-history.json 一致）。
+删除标的：点击标的行末「删除」，弹窗确认后移除（QQQ 与用户选定的原型基金不可删除）。
+持久化：自定义标的存储于 localStorage，key = 'clec-custom-assets'。
+???? MVP 阶段不接入实时行情 API，历史数据由用户手动上传或粘贴 JSON，格式校验须在前端完成。
+
+3.2 仓位拖拽调整（A2）
+配置面板中原有 QQQ/QLD 权重输入框，改为可拖拽滑块（Slider）组合，支持多资产联动。
+3.2.1 交互规则
+所有标的权重之和恒等于 100%。
+拖动某一标的滑块时，剩余资产的比例按其当前权重等比缩放（类似 pie 联动）。
+现金（Cash）可被设为 0%，但不可为负。
+每个标的滑块最小步长 1%，最大 100%。
+贡献权重（Contribution Weight）同步显示独立滑块组，逻辑相同。
+3.2.2 数据模型
+AssetConfig 中增加：
+customWeights: Record<string, number>    // { 'TQQQ': 20, 'KORU': 10 }
+contributionCustomWeights: Record<string, number>
+回测引擎读取 customWeights 时，与 qqqWeight/qldWeight 并列计算持仓和估值。
+
+3.3 移动均线（A3）
+在「市场监控（MarketMonitor）」面板及股价对比图中，叠加原型基金的 20 日、50 日、200 日移动均线（SMA）。
+3.3.1 计算口径
+数据源：marketData 中原型基金的月度 Close 价格（即现有 qqqClose）。
+SMA-20：最近 20 个月收盘价均值。SMA-50：最近 50 个月。SMA-200：最近 200 个月。
+月度数据较稀疏，均线名称在 UI 中展示为「20M均线 / 50M均线 / 200M均线」（月均线）。
+数据点不足时，该均线不显示，图例置灰。
+3.3.2 实现位置
+新增工具函数 services/maUtils.ts，导出 calculateSMA(data: number[], period: number): (number | null)[]。
+ResultsDashboard 的主折线图叠加三条均线，颜色固定：20M=#f59e0b，50M=#3b82f6，200M=#8b5cf6。
+MarketMonitor 面板新增「均线」开关（默认开启），可单独切换显示。
+
+3.4 股价对比图（A4）
+在「市场监控（MarketMonitor）」面板新增独立图表，展示用户配置的所有标的（QQQ、QLD 及自定义标的）的价格走势折线对比。
+3.4.1 功能要求
+图表类型：Recharts LineChart，X 轴为日期，Y 轴为归一化指数（以回测起始日 = 100 为基准），便于不同价格量级的标的对比。
+图例：每条线显示 Ticker + 当前价格变化百分比。
+时间范围：与主回测时间范围联动，或单独设置「近1年 / 近3年 / 全部」快捷切换。
+均线叠加：复用 A3 的 calculateSMA，在此图表上也可叠加均线（可选开关）。
+3.4.2 组件位置
+在 MarketMonitor.tsx 下方新增 <PriceComparisonChart /> 子组件，或作为独立标签页，具体由开发团队根据布局决定。
+
+3.5 信号推送（A5）
+系统定时扫描用户指定标的，当出现买入信号时通过配置的渠道通知用户。
+3.5.1 买入信号定义
+信号名称	触发条件	优先级
+均线金叉-20/50	20M均线由下穿上突破50M均线	高
+均线金叉-50/200	50M均线由下穿上突破200M均线（黄金交叉）	高
+回撤买点	标的价格跌破200M均线后首次收盘在200M均线上方	中
+自定义阈值	标的从高位回撤达用户设定百分比（默认-10%）	可配置
+
+3.5.2 推送渠道（优先级顺序）
+渠道配置统一在「设置 → 推送配置」面板，每个渠道可单独启用/禁用：
+渠道	配置项	说明
+微信 (WeChat)	企业微信 Webhook URL	通过企业微信机器人发送，需用户在企业微信创建群机器人获取 URL。
+钉钉 (DingTalk)	钉钉自定义机器人 Webhook + 签名密钥	支持安全签名验证，消息类型 markdown。
+邮件 (Email)	SMTP Host/Port/User/Pass + 收件人	通过用户自有 SMTP 发送，前端调用本地代理或用户部署的后端。
+Telegram	Bot Token + Chat ID	调用 Telegram Bot API 发送消息。
+
+3.5.3 架构设计
+前端定时器（setInterval，默认每小时检查一次，间隔可配置）在用户已开启推送时执行信号检测。
+推送功能整体由一个全局开关控制（ON/OFF），UI 位于顶部导航栏。
+渠道调用通过用户配置的 Webhook 直接从浏览器端发出，无需平台后端。
+???? Telegram 因浏览器 CORS 限制，需用户自行部署简单代理（提供示例 Docker Compose 配置）或使用 Vercel Edge Function。邮件同样需要代理端。
+信号历史：最近 50 条信号记录存于 localStorage，在「推送历史」面板展示。
+推送消息模板（示例）：
+「[CLEC 信号] TQQQ 买入信号
+信号：20M/50M 均线金叉
+当前价：$65.40 (+2.3% 今日)
+时间：2025-01-15 16:00 EST」
+
+
+4. 功能 B：新增两种熊市策略
+两种策略共用相同的市场状态判断机制（高水位/低水位追踪），但操作方向不同：前者转换仓位，后者质押借款买入。
+4.1 市场状态共用机制
+4.1.1 高水位/低水位追踪
+在 strategyMemory 中维护：
+字段	类型	说明
+hwm (High Water Mark)	number	原型基金历史最高收盘价，仅单调递增。
+lwm (Low Water Mark)	number | null	从 hwm 下跌后记录的最低收盘价。初始为 null，进入跌5%阶段后开始追踪。
+bearPhase	number (0-4)	当前熊市阶段：0=正常，1=-10%，2=-20%，3=-30%，4=-40%。只增不减（直到进入反弹逻辑）。
+recoveryPhase	number (0-4)	当前反弹阶段：0=未反弹，1=+10%，2=+20%，3=+30%，4=+40%。
+alertSent5pct	boolean	是否已发送-5%预警通知，避免重复推送。
+mode	'normal' | 'bear' | 'recovery'	当前策略模式。
+
+4.1.2 状态转换规则
+正常 → 熊市：原型基金收盘价跌破 HWM × (1 - 0.10) 时，bearPhase 从 0 升至 1（-10% 触发第一档操作），同时发送 -5% 预警。
+熊市阶段递进：每当收盘跌破下一阈值（-20%、-30%、-40%），bearPhase 递增，执行对应档操作。bearPhase 最大为 4（-40%），不再递增。
+进入反弹追踪：当收盘价高于 LWM × 1.10（即从低点涨 10%），mode 变为 'recovery'，bearPhase 锁定不再变化。
+反弹阶段递进：每当收盘涨过 LWM × (1 + N×0.10)，recoveryPhase 递增，执行对应档平仓操作。
+完全恢复：recoveryPhase = 4（从低点+40%）后，所有临时仓位/债务清零，mode 恢复 'normal'，HWM 更新为当前价。
+???? -5% 仅作预警通知，不触发实际交易。-10% 开始才触发第一档交易。
+
+4.2 策略 B1：熊市仓位转换型（BEAR_ROTATION）
+核心思路：市场下跌时，将部分1倍原型基金仓位「旋转」成3倍杠杆基金，用相同名义敞口博取更高反弹收益；反弹时逐步换回原型基金锁定收益。
+4.2.1 操作规则
+触发条件	操作	说明
+原型基金从HWM下跌 5%	推送预警通知（不交易）	提示用户市场开始转弱，可考虑关注。
+下跌 10%（bearPhase=1）	将持仓原型基金的 10% 卖出 → 买入等值3倍杠杆基金	首档介入，试仓。
+下跌 20%（bearPhase=2）	将持仓原型基金的 20% 卖出 → 买入等值3倍杠杆基金	累计转换仓位约 30%。
+下跌 30%（bearPhase=3）	将持仓原型基金的 30% 卖出 → 买入等值3倍杠杆基金	累计转换仓位约 51%。
+下跌 40%（bearPhase=4）	将持仓原型基金的 40% 卖出 → 买入等值3倍杠杆基金	不再转换，等待反弹。
+从LWM反弹 10%（recoveryPhase=1）	将持有的3倍杠杆基金的 10% 卖出 → 买回原型基金	开始退出杠杆。
+从LWM反弹 20%（recoveryPhase=2）	将持有的3倍杠杆基金的 20% 卖出 → 买回原型基金	继续降低杠杆。
+从LWM反弹 30%（recoveryPhase=3）	将持有的3倍杠杆基金的 30% 卖出 → 买回原型基金	—
+从LWM反弹 40%（recoveryPhase=4）	将持有的3倍杠杆基金的 40% 卖出 → 买回原型基金，mode=normal	完全退出熊市模式。
+
+4.2.2 重要约束
+「将持仓X%卖出」是指执行操作时实际持有该标的的 X%，而非初始总资产的 X%。
+3倍杠杆基金默认为 TQQQ（用户可在策略配置中选择其他已添加的3倍标的）。
+仓位不足时，以实际可用仓位为准，事件日志记录实际成交量。
+每档操作只执行一次（bearPhase/recoveryPhase 单调递增保证幂等性）。
+4.2.3 新增配置项（AssetConfig 扩展）
+字段	类型	默认值	说明
+bearRotation.tripleETF	string	'TQQQ'	用于转换的3倍杠杆基金 Ticker。
+bearRotation.enableAlerts	boolean	true	是否通过推送渠道发送交易通知。
+
+4.3 策略 B2：熊市质押借款型（BEAR_PLEDGE）
+核心思路：市场下跌时，以持仓资产为抵押进行质押借款（最多总资产 10%），用借款资金分批买入用户指定基金；反弹时分批卖出还款。
+4.3.1 操作规则
+触发条件	操作	说明
+原型基金从HWM下跌 5%	推送预警通知（不借款）	提示用户可以开始准备质押借款额度。
+下跌 10%（bearPhase=1）	借入总资产 1%（质押额度的10%）→ 买入指定基金	首档动用借款10%。
+下跌 20%（bearPhase=2）	再借入总资产 1%（质押额度的20%）→ 买入指定基金	累计借款20%额度。
+下跌 30%（bearPhase=3）	再借入总资产 1% → 买入指定基金	累计借款30%额度。
+下跌 40%（bearPhase=4）	再借入总资产 1% → 买入指定基金	累计借款40%额度，不再追加。
+从LWM反弹 10%（recoveryPhase=1）	卖出对应批次买入的 10%仓位 → 还款	先进先出原则。
+从LWM反弹 20%（recoveryPhase=2）	卖出对应批次买入的 20%仓位 → 还款	—
+从LWM反弹 30%（recoveryPhase=3）	卖出对应批次买入的 30%仓位 → 还款	—
+从LWM反弹 40%（recoveryPhase=4）	卖出全部质押买入仓位 → 全部还款，mode=normal	清零所有质押债务。
+
+4.3.2 重要约束
+质押借款额度上限 = 总资产净值 × 10%，固定在进入熊市阶段时的总资产快照计算，后续市场下跌不再调整上限（防止追加暴露）。
+借款利息：沿用现有 LeverageConfig.interestRate，计入 debtBalance，与现有杠杆利息计算逻辑一致。
+每档借款独立记账，strategyMemory 记录各批次的买入价格和数量，用于反弹时精确平仓。
+若市场继续下跌至 bearPhase=4 后，不再新增借款，现有借款继续计息。
+买入标的由用户在策略配置中选择，可选：原型基金（QQQ）、2倍基金（QLD）或3倍基金（TQQQ）。
+4.3.3 新增配置项（AssetConfig 扩展）
+字段	类型	默认值	说明
+bearPledge.buyTarget	string	'QQQ'	质押借款后买入的标的 Ticker，可选 QQQ/QLD/TQQQ 或其他已添加标的。
+bearPledge.maxPledgeRatio	number	0.10	最大质押借款占总资产比例，默认10%。
+bearPledge.enableAlerts	boolean	true	是否发送每次操作的推送通知。
+
+
+5. 数据流与架构变更
+5.1 constants.ts
+MARKET_DATA 构建逻辑抽象为函数 buildMarketData(customAssets: CustomAsset[])，支持动态注入自定义标的数据。
+新增 DEFAULT_CUSTOM_ASSETS: CustomAsset[] = [] 导出，用于初始化。
+5.2 types.ts
+MarketDataRow 增加 customClose: Record<string, number>。
+PortfolioState.shares 类型从 { QQQ: number; QLD: number } 改为 Record<string, number>，向下兼容。
+AssetConfig 增加 customWeights、contributionCustomWeights、bearRotation、bearPledge 字段。
+StrategyType 增加 'BEAR_ROTATION' | 'BEAR_PLEDGE'。
+5.3 simulationEngine.ts
+估值计算循环改为遍历所有标的（QQQ、QLD + 自定义），动态求和。
+Beta 计算：TQQQ 按 leverageMultiplier=3 计权，自定义标的以其 leverageMultiplier 为权重。
+5.4 strategies.ts
+新增 strategyBearRotation 和 strategyBearPledge 函数，签名与现有 StrategyFunction 一致。
+getStrategyByType 增加两个新 case。
+5.5 新增文件
+文件路径	职责
+services/maUtils.ts	导出 calculateSMA(data, period) 工具函数。
+services/alertService.ts	封装微信/钉钉/邮件/Telegram 推送逻辑，导出 sendAlert(channels, message)。
+services/signalDetector.ts	定时扫描，检测均线金叉、回撤买点等信号，调用 alertService。
+components/CustomAssetManager.tsx	自定义标的列表与新增/删除 UI。
+components/PriceComparisonChart.tsx	多标的归一化价格对比折线图。
+components/AlertSettings.tsx	推送渠道配置面板（Webhook/SMTP/Token 输入）。
+components/AlertHistory.tsx	推送历史记录展示（最近50条）。
+
+
+6. UI/UX 设计规范
+6.1 整体布局变更
+顶部导航栏新增：「推送」全局开关（Toggle），激活时显示绿色指示灯。
+ConfigPanel 新增「标的管理」标签页，与现有「配置」「策略」等并列。
+MarketMonitor 面板底部新增股价对比图区域。
+6.2 仓位滑块组件规格
+使用 HTML range input 实现，避免引入重型 UI 库。
+每个标的行：[彩色图例点] [Ticker 标签] [—— 滑块 ——] [数值输入框 %]。
+最下方实时显示「总计：100%」，超出或不足时标红提示。
+同时保留数字输入框，用户可直接键入精确数字，滑块联动。
+6.3 策略选择扩展
+ConfigPanel 策略下拉选项新增：
+StrategyType 值	显示名（中文）	显示名（英文）
+BEAR_ROTATION	熊市仓位转换型	Bear Market Rotation
+BEAR_PLEDGE	熊市质押借款型	Bear Market Pledge
+
+选中两种新策略时，配置面板下方显示对应策略专属配置区（B1 显示「杠杆基金选择」，B2 显示「买入标的」与「最大质押比例」）。
+6.4 事件日志
+ResultsDashboard 的「事件日志」面板支持展示新策略的交易事件，事件类型扩展：
+事件 type	说明
+ROTATION_IN	转入3倍杠杆基金（B1）
+ROTATION_OUT	转出3倍杠杆基金（B2）
+PLEDGE_BORROW	质押借款买入（B2）
+PLEDGE_REPAY	卖出还款（B2）
+ALERT_SENT	信号推送已发送
+
+
+7. 测试要求
+7.1 单元测试
+services/__tests__/maUtils.test.ts：验证 SMA 计算正确性（数据不足时返回 null，边界值）。
+services/__tests__/bearRotation.test.ts：覆盖 bearPhase 0→4 的仓位转换、recoveryPhase 0→4 的反转操作，以及边界（仓位不足、HWM 更新）。
+services/__tests__/bearPledge.test.ts：覆盖质押借款额度上限、分批买入、分批还款、利息累计。
+services/__tests__/signalDetector.test.ts：验证均线金叉检测逻辑（防止重复触发）。
+7.2 E2E 测试
+e2e/bear_strategies.spec.ts：验证两种新策略在 UI 中可被选中、参数可配置、运行后结果面板正常渲染。
+e2e/custom_assets.spec.ts：验证新增/删除自定义标的、权重滑块联动、回测结果包含自定义标的估值。
+e2e/alert_settings.spec.ts：验证推送开关、渠道配置保存/读取。
+
+8. 交付里程碑
+阶段	目标	核心交付物	参考工期
+M1	类型与引擎扩展	types.ts + simulationEngine.ts 重构；自定义标的数据模型落地	3天
+M2	新策略核心逻辑	strategyBearRotation + strategyBearPledge 实现；单元测试覆盖	5天
+M3	仓位滑块 + 均线	UI 拖拽仓位组件；maUtils.ts；图表叠加均线	4天
+M4	股价对比图 + 推送	PriceComparisonChart；alertService + 4渠道集成；推送开关	5天
+M5	E2E测试 + 文档	全量 E2E 通过；README 更新；Demo 录屏	3天
+
+9. 风险与注意事项
+风险点	影响	缓解方案
+CORS 限制推送渠道	Telegram / 邮件无法从浏览器直接调用	提供 Vercel Edge Function 模板 + Docker 代理示例。
+自定义标的数据质量	历史数据缺口导致回测失真	前端校验 JSON 格式；缺失月份线性插值并标注警告。
+PortfolioState.shares 泛化	现有5种策略需同步改造	抽象 getShareValue(shares, ticker, price) 工具函数，统一估值逻辑。
+HWM/LWM 时序精度	月度数据下阈值触发可能有1个月滞后	文档注明回测为月度模拟，与实盘存在偏差，告知用户。
+信号推送过于频繁	用户体验差	每档信号设置 cooldown（同档位至少1个月不重复推送）。
+
+
+CLEC Strategy Backtest · PRD v1.0 · 仅供 antigravity 开发团队内部使用
