@@ -20,6 +20,7 @@ import {
   Upload,
   Copy,
   Sparkles,
+  RefreshCw,
 } from 'lucide-react'
 import { useTranslation } from '../services/i18n'
 
@@ -31,6 +32,10 @@ interface ConfigPanelProps {
   hasResults: boolean
   showBenchmark: boolean
   onShowBenchmarkChange: (val: boolean) => void
+  // 自定义标的加载状态（来自 App.tsx）
+  fetchingSymbols?: Set<string>
+  fetchErrors?: Record<string, string>
+  onRefetchSymbol?: (symbol: string) => void
 }
 
 // High-contrast palette for distinct chart lines
@@ -57,6 +62,10 @@ const DEFAULT_ASSET_CONFIG: AssetConfig = {
   contributionQqqWeight: 100, // Default to safer contribution
   contributionQldWeight: 0,
   cashYieldAnnual: 2.0,
+  // 自定义第三标的（默认 TQQQ，权重为0，用户可自行调整）
+  customSymbol: 'TQQQ',
+  customWeight: 0,
+  contributionCustomWeight: 0,
   leverage: {
     enabled: false,
     interestRate: 5.0,
@@ -82,6 +91,9 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
   hasResults,
   showBenchmark,
   onShowBenchmarkChange,
+  fetchingSymbols = new Set(),
+  fetchErrors = {},
+  onRefetchSymbol,
 }) => {
   const { t } = useTranslation()
   const [editingProfileId, setEditingProfileId] = useState<string | null>(null)
@@ -100,6 +112,7 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
     { value: 'SMART', label: t('strat_smart') },
     { value: 'FLEXIBLE_1', label: t('strat_flex1') },
     { value: 'FLEXIBLE_2', label: t('strat_flex2') },
+    { value: 'DIP_BUYING_STATE', label: t('strat_dipBuying') },
   ]
 
   const getStrategyLabel = (type: string) => {
@@ -360,11 +373,17 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
     const profile = profiles.find((p) => p.id === editingProfileId)
     if (!profile) return null
 
-    const cashWeight = Math.max(0, 100 - profile.config.qqqWeight - profile.config.qldWeight)
+    const customW = profile.config.customWeight ?? 0
+    const cashWeight = Math.max(0, 100 - profile.config.qqqWeight - profile.config.qldWeight - customW)
+    const customContribW = profile.config.contributionCustomWeight ?? 0
     const contribCashWeight = Math.max(
       0,
-      100 - profile.config.contributionQqqWeight - profile.config.contributionQldWeight,
+      100 - profile.config.contributionQqqWeight - profile.config.contributionQldWeight - customContribW,
     )
+    // 自定义标的的加载状态（未设置时默认为 'TQQQ'）
+    const customSym = profile.config.customSymbol?.toUpperCase().trim() || 'TQQQ'
+    const isLoadingCustom = fetchingSymbols.has(customSym)
+    const customFetchError = customSym !== '' ? fetchErrors[customSym] : undefined
 
     // Calculate Maintenance Ratio for UI display
     const currentMaxLtv = profile.config.leverage?.maxLtv ?? 100
@@ -591,6 +610,7 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
               <PieChart className="w-4 h-4" /> {t('targetAllocation')}
             </div>
 
+            {/* QQQ 滑块 */}
             <div>
               <div className="flex justify-between text-xs mb-1">
                 <span>QQQ</span>
@@ -603,15 +623,18 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
                 value={profile.config.qqqWeight}
                 onChange={(e) => {
                   const val = Number(e.target.value)
+                  const newCustomW = profile.config.customWeight ?? 0
                   const updates: Partial<AssetConfig> = { qqqWeight: val }
-                  if (val + profile.config.qldWeight > 100)
-                    updates.qldWeight = Math.max(0, 100 - val)
+                  // 确保三者之和不超过100
+                  if (val + profile.config.qldWeight + newCustomW > 100)
+                    updates.qldWeight = Math.max(0, 100 - val - newCustomW)
                   updateProfile(profile.id, updates)
                 }}
                 className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
               />
             </div>
 
+            {/* QLD 滑块 */}
             <div>
               <div className="flex justify-between text-xs mb-1">
                 <span>QLD (2x)</span>
@@ -624,12 +647,84 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
                 value={profile.config.qldWeight}
                 onChange={(e) => {
                   const val = Number(e.target.value)
+                  const newCustomW = profile.config.customWeight ?? 0
                   const updates: Partial<AssetConfig> = { qldWeight: val }
-                  if (val + profile.config.qqqWeight > 100)
-                    updates.qqqWeight = Math.max(0, 100 - val)
+                  // 确保三者之和不超过100
+                  if (val + profile.config.qqqWeight + newCustomW > 100)
+                    updates.qqqWeight = Math.max(0, 100 - val - newCustomW)
                   updateProfile(profile.id, updates)
                 }}
                 className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600"
+              />
+            </div>
+
+            {/* 自定义标的：代码输入框 + 权重滑块 */}
+            <div className="border-t border-slate-100 pt-3 mt-1">
+              {/* 标的代码输入 */}
+              <div className="flex items-center gap-2 mb-2">
+                <label className="text-[10px] text-slate-500 uppercase font-bold whitespace-nowrap">
+                  {t('customSymbol')}
+                </label>
+                <input
+                  type="text"
+                  value={profile.config.customSymbol ?? 'TQQQ'}
+                  onChange={(e) =>
+                    updateProfile(profile.id, {
+                      customSymbol: e.target.value.toUpperCase().trim(),
+                    })
+                  }
+                  placeholder={t('customSymbolPlaceholder')}
+                  maxLength={10}
+                  className="w-24 px-2 py-1 border border-slate-200 rounded-md text-xs font-mono uppercase outline-none focus:ring-2 focus:ring-orange-400"
+                />
+                {/* 加载状态指示 */}
+                {isLoadingCustom && (
+                  <span className="flex items-center gap-1 text-[10px] text-orange-500">
+                    <span className="inline-block w-2 h-2 rounded-full bg-orange-400 animate-ping" />
+                    {t('fetchingData')}
+                  </span>
+                )}
+                {!isLoadingCustom && customFetchError && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-red-500" title={customFetchError}>
+                      ⚠ {t('fetchError')}
+                    </span>
+                    {onRefetchSymbol && (
+                      <button
+                        onClick={() => onRefetchSymbol(customSym)}
+                        className="text-[10px] text-slate-500 hover:text-slate-800 flex items-center gap-1 transition-colors"
+                        title={t('fetchSources')}
+                      >
+                        <RefreshCw className="w-3 h-3" /> {t('retryFetch')}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {!isLoadingCustom && !customFetchError && customSym && (
+                  <span className="text-[10px] text-green-600">✓</span>
+                )}
+              </div>
+              {/* 权重滑块 */}
+              <div className="flex justify-between text-xs mb-1">
+                <span>{profile.config.customSymbol || 'TQQQ'}</span>
+                <span className="font-bold">{customW}%</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={customW}
+                onChange={(e) => {
+                  const val = Number(e.target.value)
+                  const updates: Partial<AssetConfig> = { customWeight: val }
+                  // 确保三者之和不超过100
+                  if (val + profile.config.qqqWeight + profile.config.qldWeight > 100) {
+                    const excess = val + profile.config.qqqWeight + profile.config.qldWeight - 100
+                    updates.qldWeight = Math.max(0, profile.config.qldWeight - excess)
+                  }
+                  updateProfile(profile.id, updates)
+                }}
+                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-orange-500"
               />
             </div>
 
@@ -644,6 +739,7 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
               <Coins className="w-4 h-4" /> {t('contributionAllocation')}
             </div>
 
+            {/* DCA QQQ 滑块 */}
             <div>
               <div className="flex justify-between text-xs mb-1">
                 <span>DCA (QQQ)</span>
@@ -656,15 +752,20 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
                 value={profile.config.contributionQqqWeight}
                 onChange={(e) => {
                   const val = Number(e.target.value)
+                  const newCustomContribW = profile.config.contributionCustomWeight ?? 0
                   const updates: Partial<AssetConfig> = { contributionQqqWeight: val }
-                  if (val + profile.config.contributionQldWeight > 100)
-                    updates.contributionQldWeight = Math.max(0, 100 - val)
+                  if (val + profile.config.contributionQldWeight + newCustomContribW > 100)
+                    updates.contributionQldWeight = Math.max(
+                      0,
+                      100 - val - newCustomContribW,
+                    )
                   updateProfile(profile.id, updates)
                 }}
                 className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
               />
             </div>
 
+            {/* DCA QLD 滑块 */}
             <div>
               <div className="flex justify-between text-xs mb-1">
                 <span>DCA (QLD)</span>
@@ -677,14 +778,47 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
                 value={profile.config.contributionQldWeight}
                 onChange={(e) => {
                   const val = Number(e.target.value)
+                  const newCustomContribW = profile.config.contributionCustomWeight ?? 0
                   const updates: Partial<AssetConfig> = { contributionQldWeight: val }
-                  if (val + profile.config.contributionQqqWeight > 100)
-                    updates.contributionQqqWeight = Math.max(0, 100 - val)
+                  if (val + profile.config.contributionQqqWeight + newCustomContribW > 100)
+                    updates.contributionQqqWeight = Math.max(
+                      0,
+                      100 - val - newCustomContribW,
+                    )
                   updateProfile(profile.id, updates)
                 }}
                 className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-purple-600"
               />
             </div>
+
+            {/* DCA 自定义标的滑块（使用与持仓区相同的标的代码）*/}
+            {customSym && (
+              <div className="border-t border-slate-100 pt-2">
+                <div className="flex justify-between text-xs mb-1">
+                  <span>{t('dcaCustom')} ({customSym})</span>
+                  <span className="font-bold">{customContribW}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={customContribW}
+                  onChange={(e) => {
+                    const val = Number(e.target.value)
+                    const updates: Partial<AssetConfig> = { contributionCustomWeight: val }
+                    // 确保DCA三者之和不超过100
+                    const total = val + profile.config.contributionQqqWeight + profile.config.contributionQldWeight
+                    if (total > 100) {
+                      const excess = total - 100
+                      updates.contributionQldWeight = Math.max(0, profile.config.contributionQldWeight - excess)
+                    }
+                    updateProfile(profile.id, updates)
+                  }}
+                  className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                />
+              </div>
+            )}
+
             <div className="text-xs text-center text-slate-400">
               {t('dcaCash')}: {contribCashWeight.toFixed(1)}%
             </div>

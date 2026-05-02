@@ -8,6 +8,9 @@ export interface MarketDataRow {
   // Low prices - used for valuation and margin call detection
   qqqLow: number
   qldLow: number
+  // 自定义第三标的（可选，如 TQQQ）
+  customClose?: number
+  customLow?: number
 }
 
 export interface LeverageConfig {
@@ -39,8 +42,13 @@ export interface AssetConfig {
   contributionQqqWeight: number // 0-100
   contributionQldWeight: number // 0-100
 
-  // Cash weight is derived: 100 - QQQ - QLD
+  // Cash weight is derived: 100 - QQQ - QLD - CUSTOM
   cashYieldAnnual: number // Percentage, e.g., 4.0
+
+  // 自定义第三标的配置（可选，默认 TQQQ）
+  customSymbol?: string // 股票代码，如 'TQQQ'
+  customWeight?: number // 0-100，初始配置中的目标权重
+  contributionCustomWeight?: number // 0-100，定投分配中的权重
 
   // Flexible Rebalancing Config
   annualExpenseAmount?: number // Annual living expense amount (default 2% of initial capital)
@@ -50,7 +58,7 @@ export interface AssetConfig {
   leverage: LeverageConfig
 }
 
-export type StrategyType = 'NO_REBALANCE' | 'REBALANCE' | 'SMART' | 'FLEXIBLE_1' | 'FLEXIBLE_2'
+export type StrategyType = 'NO_REBALANCE' | 'REBALANCE' | 'SMART' | 'FLEXIBLE_1' | 'FLEXIBLE_2' | 'DIP_BUYING_STATE'
 
 export interface Profile {
   id: string
@@ -71,6 +79,7 @@ export interface PortfolioState {
   shares: {
     QQQ: number
     QLD: number
+    CUSTOM: number // 自定义第三标的持仓份数
   }
   cashBalance: number
   debtBalance: number // New: Track margin loan balance

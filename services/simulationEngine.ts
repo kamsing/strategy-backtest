@@ -29,10 +29,10 @@ export const runBacktest = (
   // Initial empty state
   let currentState: PortfolioState = {
     date: marketData[0].date,
-    shares: { QQQ: 0, QLD: 0 },
+    shares: { QQQ: 0, QLD: 0, CUSTOM: 0 }, // 初始化三标的持仓
     cashBalance: 0,
     debtBalance: 0,
-    accruedInterest: 0, // NEW: Track unpaid simple interest
+    accruedInterest: 0,
     totalValue: 0,
     strategyMemory: {},
     ltv: 0,
@@ -182,14 +182,28 @@ export const runBacktest = (
         description: `${qldDiff > 0 ? 'Buy' : 'Sell'} ${Math.abs(qldDiff).toFixed(2)} QLD @ ${dataRow.qldClose.toFixed(2)}`,
       })
     }
+    // 检测自定义标的（CUSTOM）的交易
+    const customDiff = currentState.shares.CUSTOM - sharesBeforeStrat.CUSTOM
+    if (Math.abs(customDiff) > 0.001 && dataRow.customClose && dataRow.customClose > 0) {
+      const customSymbol = 'CUSTOM'
+      const cost = customDiff * dataRow.customClose
+      monthEvents.push({
+        type: 'TRADE',
+        amount: -cost,
+        description: `${customDiff > 0 ? 'Buy' : 'Sell'} ${Math.abs(customDiff).toFixed(2)} ${customSymbol} @ ${dataRow.customClose.toFixed(2)}`,
+      })
+    }
 
-    // Detect DCA Deposit (Approximation: If we bought shares but cash didn't drop by full amount, or cash increased)
-    // Net flow = (Cash_End - Cash_Start) + Cost_Of_Buys
-    // If Net flow > 0, that's external deposit.
-    const netTradeCost = qqqDiff * dataRow.qqqClose + qldDiff * dataRow.qldClose
+    // 检测DCA入金（近似：若买股后现金未按全额减少，差额为外部入金）
+    // 净交易成本 = QQQ+QLD+CUSTOM 三者买入成本之和
+    const customTradeCost =
+      dataRow.customClose && dataRow.customClose > 0
+        ? customDiff * dataRow.customClose
+        : 0
+    const netTradeCost = qqqDiff * dataRow.qqqClose + qldDiff * dataRow.qldClose + customTradeCost
     const impliedCashFlow = currentState.cashBalance - cashBeforeStrat + netTradeCost
 
-    // Small epsilon for float errors
+    // 浮点误差容忍值
     if (impliedCashFlow > 1.0) {
       monthEvents.push({
         type: 'DEPOSIT',
@@ -203,10 +217,15 @@ export const runBacktest = (
       const currentMonth = parseInt(dataRow.date.substring(5, 7)) - 1
 
       // Use LOW prices for conservative valuation (margin call assessment)
+      // 自定义标的低价估値（用于保证金评估）
+      const customLowVal =
+        dataRow.customLow && dataRow.customLow > 0
+          ? (currentState.shares.CUSTOM ?? 0) * dataRow.customLow
+          : 0
       const qqqValue = currentState.shares.QQQ * dataRow.qqqLow
       const qldValue = currentState.shares.QLD * dataRow.qldLow
       const cashValue = currentState.cashBalance
-      const totalAssetValue = qqqValue + qldValue + cashValue
+      const totalAssetValue = qqqValue + qldValue + customLowVal + cashValue
 
       const effectiveCollateral =
         qqqValue * leverage.qqqPledgeRatio +
@@ -289,24 +308,26 @@ export const runBacktest = (
 
     // 4. Update Net Value & Risk Metrics
     if (!isBankrupt) {
-      // Use LOW prices for conservative net value calculation
+      // 低价估値用于静态中的净资产计算
       const qqqVal = currentState.shares.QQQ * dataRow.qqqLow
       const qldVal = currentState.shares.QLD * dataRow.qldLow
+      const customLowVal2 =
+        dataRow.customLow && dataRow.customLow > 0
+          ? (currentState.shares.CUSTOM ?? 0) * dataRow.customLow
+          : 0
       const cashVal = currentState.cashBalance
 
-      const assets = qqqVal + qldVal + cashVal
-      // Net Equity = Assets - Principal Debt - Accrued Simple Interest
+      const assets = qqqVal + qldVal + customLowVal2 + cashVal
+      // 净权益 = 资产 - 本金债务 - 未付利息
       currentState.totalValue = Math.max(
         0,
         assets - currentState.debtBalance - currentState.accruedInterest,
       )
 
-      // Calculate Beta
-      // Beta Reference: QQQ=1, Cash=0, QLD=2.
-      // We calculate weighted beta based on Equity to show effective leverage.
-      // Formula: (ValQQQ*1 + ValQLD*2 + Cash*0) / NetEquity
+      // 计算 Beta（QQQ=1, Cash=0, QLD=2, CUSTOM=参考QQQ）
+      // CUSTOM 暂按 Beta=1 计算（无杂指数ETF假设）
       if (currentState.totalValue > 0) {
-        currentState.beta = (qqqVal * 1 + qldVal * 2) / currentState.totalValue
+        currentState.beta = (qqqVal * 1 + qldVal * 2 + customLowVal2 * 1) / currentState.totalValue
       } else {
         currentState.beta = 0
       }

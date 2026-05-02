@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { strategyNoRebalance, strategyRebalance, strategySmart } from '../strategies'
+import {
+  strategyNoRebalance,
+  strategyRebalance,
+  strategySmart,
+  strategyDipBuyingState,
+} from '../strategies'
 import { AssetConfig, MarketDataRow, PortfolioState } from '../../types'
 
 const mockConfig: AssetConfig = {
@@ -123,11 +128,61 @@ describe('Strategies', () => {
   describe('strategySmart', () => {
     it('initializes memory correctly', () => {
       const newState = strategySmart(mockState, mockMarketData, mockConfig, 0)
-      expect(newState.strategyMemory.currentYear).toBe(2020)
-      expect(newState.strategyMemory.startQLDVal).toBeDefined()
+      const memory = newState.strategyMemory as any
+      expect(memory.currentYear).toBe(2020)
+      expect(memory.startQLDVal).toBeDefined()
+    })
+  })
+
+  describe('strategyDipBuyingState', () => {
+    it('should track high water mark and increase QLD on drawdowns', () => {
+      // Month 0: Init at 100. Drawdown = 0.
+      const state0 = strategyDipBuyingState(
+        mockState,
+        { ...mockMarketData, qqqClose: 100 },
+        mockConfig,
+        0,
+      )
+      const memory0 = state0.strategyMemory as any
+      expect(memory0.highWaterMark).toBe(100)
+      expect(memory0.currentState).toBe(0)
+
+      // Month 1: Price drops to 85 (-15%). Should enter State 1.
+      // QLD allocation should be max(40%, 20%) = 40% (since mockConfig has 40% QLD).
+      // Let's use a config with lower QLD to see the override.
+      const lowQldConfig = { ...mockConfig, qldWeight: 10, qqqWeight: 90 }
+      const state1 = strategyDipBuyingState(
+        state0,
+        { ...mockMarketData, qqqClose: 85, qldClose: 40 },
+        lowQldConfig,
+        1,
+      )
+
+      const memory1 = state1.strategyMemory as any
+      expect(memory1.currentState).toBe(1)
+      // Total Value: 
+      // Month 0 bought: 60 QQQ (6000/100), 80 QLD (4000/50).
+      // Month 1 price: QQQ=85, QLD=40. Value = 60*85 + 80*40 = 5100 + 3200 = 8300.
+      // Month 1 Contribution: 1000. TotalValue = 8300 + 1000 = 9300.
+      // State 1 Target QLD: 20% of 9300 = 1860.
+      // QLD Shares: 1860 / 40 = 46.5.
+      expect(state1.totalValue).toBe(9300)
+      expect(state1.shares.QLD).toBeCloseTo(46.5)
     })
 
-    // More complex tests for profit taking/dip buying could be added here
-    // simulating a December check.
+    it('should reach state 5 on -50% drawdown', () => {
+      const state0 = {
+        ...mockState,
+        strategyMemory: { highWaterMark: 100, currentState: 0 } as any,
+      }
+      const crashData = { ...mockMarketData, qqqClose: 45, qldClose: 10 } // -55%
+      const newState = strategyDipBuyingState(state0, crashData, mockConfig, 1)
+
+      const memory = newState.strategyMemory as any
+      expect(memory.currentState).toBe(5)
+      // Should be 100% QLD
+      expect(newState.shares.QQQ).toBe(0)
+      expect(newState.shares.QLD * 10).toBeCloseTo(newState.totalValue)
+    })
   })
 })

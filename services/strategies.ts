@@ -7,10 +7,13 @@ interface CashAdequacyResult {
 }
 
 const getAssetAllocation = (config: AssetConfig) => {
-  const cashWeight = Math.max(0, 100 - config.qqqWeight - config.qldWeight)
+  // 如果启用自定义标的，现金权重 = 100 - QQQ - QLD - CUSTOM
+  const customWeight = config.customWeight ?? 0
+  const cashWeight = Math.max(0, 100 - config.qqqWeight - config.qldWeight - customWeight)
   return {
     qqq: config.qqqWeight / 100,
     qld: config.qldWeight / 100,
+    custom: customWeight / 100,
     cash: cashWeight / 100,
   }
 }
@@ -20,13 +23,21 @@ interface StrategyMemory {
   yearInflow?: number
   startQLDVal?: number
   lastAction?: string
+  highWaterMark?: number
+  currentState?: number
 }
 
 const getContributionAllocation = (config: AssetConfig) => {
-  const cashWeight = Math.max(0, 100 - config.contributionQqqWeight - config.contributionQldWeight)
+  // 定投现金权重 = 100 - QQQ - QLD - CUSTOM
+  const customWeight = config.contributionCustomWeight ?? 0
+  const cashWeight = Math.max(
+    0,
+    100 - config.contributionQqqWeight - config.contributionQldWeight - customWeight,
+  )
   return {
     qqq: config.contributionQqqWeight / 100,
     qld: config.contributionQldWeight / 100,
+    custom: customWeight / 100,
     cash: cashWeight / 100,
   }
 }
@@ -39,25 +50,32 @@ const getContributionAllocation = (config: AssetConfig) => {
  */
 export const strategyNoRebalance: StrategyFunction = (state, marketData, config, monthIndex) => {
   const isFirstMonth = monthIndex === 0
-  const newState = { ...state, date: marketData.date }
+  // 确保 shares.CUSTOM 字段存在（向后兼容旧数据）
+  const newState = { ...state, date: marketData.date, shares: { ...state.shares, CUSTOM: state.shares.CUSTOM ?? 0 } }
+
+  // 判断是否有自定义标的以及是否有价格数据
+  const hasCustom = (config.customWeight ?? 0) > 0 && marketData.customClose && marketData.customClose > 0
+  const customClosePrice = marketData.customClose ?? 0
 
   if (isFirstMonth) {
     const weights = getAssetAllocation(config)
     newState.shares = {
       QQQ: (config.initialCapital * weights.qqq) / marketData.qqqClose,
       QLD: (config.initialCapital * weights.qld) / marketData.qldClose,
+      // 自定义标的：有权重且有价格时才买入
+      CUSTOM: hasCustom ? (config.initialCapital * weights.custom) / customClosePrice : 0,
     }
     newState.cashBalance = config.initialCapital * weights.cash
   } else {
-    // DCA Logic: Check if this month is a contribution month
+    // 定投逻辑：检查当月是否为定投月
     const currentMonth = parseInt(marketData.date.substring(5, 7)) // 1-12
 
     let isContributionMonth = false
     if (config.contributionIntervalMonths === 12) {
-      // Yearly: Check if current calendar month matches yearlyContributionMonth (default December=12)
+      // 年度定投：匹配指定月份
       isContributionMonth = currentMonth === (config.yearlyContributionMonth || 12)
     } else {
-      // Monthly/Quarterly: Use modulo logic
+      // 月度/季度：取模逻辑
       isContributionMonth = monthIndex % config.contributionIntervalMonths === 0
     }
 
@@ -66,17 +84,24 @@ export const strategyNoRebalance: StrategyFunction = (state, marketData, config,
 
       const qqqBuy = config.contributionAmount * contribWeights.qqq
       const qldBuy = config.contributionAmount * contribWeights.qld
+      const customBuy = config.contributionAmount * contribWeights.custom
       const cashAdd = config.contributionAmount * contribWeights.cash
 
       newState.shares.QQQ += qqqBuy / marketData.qqqClose
       newState.shares.QLD += qldBuy / marketData.qldClose
+      // 自定义标的定投
+      if (hasCustom && customBuy > 0) {
+        newState.shares.CUSTOM += customBuy / customClosePrice
+      }
       newState.cashBalance += cashAdd
     }
   }
 
+  const customValue = hasCustom ? newState.shares.CUSTOM * customClosePrice : 0
   newState.totalValue =
     newState.shares.QQQ * marketData.qqqClose +
     newState.shares.QLD * marketData.qldClose +
+    customValue +
     newState.cashBalance
 
   return newState
@@ -88,18 +113,24 @@ export const strategyNoRebalance: StrategyFunction = (state, marketData, config,
  */
 export const strategyRebalance: StrategyFunction = (state, marketData, config, monthIndex) => {
   const isFirstMonth = monthIndex === 0
-  const newState = strategyNoRebalance(state, marketData, config, monthIndex) // Apply base logic first
+  const newState = strategyNoRebalance(state, marketData, config, monthIndex) // 先执行基础逻辑
 
   const currentMonth = parseInt(marketData.date.substring(5, 7)) - 1
 
-  // Rebalance in January (Month 0) - but not the very first month of simulation
+  // 每年1月进行再平衡（不包括模拟第一个月）
   if (currentMonth === 0 && !isFirstMonth) {
     const totalVal = newState.totalValue
-    const targetWeights = getAssetAllocation(config) // Rebalance to TARGET portfolio
+    const targetWeights = getAssetAllocation(config)
+    const hasCustom =
+      (config.customWeight ?? 0) > 0 && marketData.customClose && marketData.customClose > 0
+    const customClosePrice = marketData.customClose ?? 0
 
-    // Reset shares to target weights
+    // 按目标权重重置持仓
     newState.shares.QQQ = (totalVal * targetWeights.qqq) / marketData.qqqClose
     newState.shares.QLD = (totalVal * targetWeights.qld) / marketData.qldClose
+    // 自定义标的再平衡
+    newState.shares.CUSTOM =
+      hasCustom ? (totalVal * targetWeights.custom) / customClosePrice : 0
     newState.cashBalance = totalVal * targetWeights.cash
   }
 
@@ -175,9 +206,14 @@ export const strategySmart: StrategyFunction = (state, marketData, config, month
     }
   }
 
+  const customValue =
+    marketData.customClose && marketData.customClose > 0
+      ? (newState.shares.CUSTOM ?? 0) * marketData.customClose
+      : 0
   newState.totalValue =
     newState.shares.QQQ * marketData.qqqClose +
     newState.shares.QLD * marketData.qldClose +
+    customValue +
     newState.cashBalance
 
   newState.strategyMemory = memory
@@ -289,10 +325,15 @@ export const strategyFlexible1: StrategyFunction = (state, marketData, config, m
     }
   }
 
-  // Recalculate Totals
+  // 重新计算总资产（含自定义标的）
+  const customValue1 =
+    marketData.customClose && marketData.customClose > 0
+      ? (newState.shares.CUSTOM ?? 0) * marketData.customClose
+      : 0
   newState.totalValue =
     newState.shares.QQQ * marketData.qqqClose +
     newState.shares.QLD * marketData.qldClose +
+    customValue1 +
     newState.cashBalance
 
   newState.strategyMemory = memory
@@ -385,9 +426,100 @@ export const strategyFlexible2: StrategyFunction = (state, marketData, config, m
     }
   }
 
+  const customValue2 =
+    marketData.customClose && marketData.customClose > 0
+      ? (newState.shares.CUSTOM ?? 0) * marketData.customClose
+      : 0
   newState.totalValue =
     newState.shares.QQQ * marketData.qqqClose +
     newState.shares.QLD * marketData.qldClose +
+    customValue2 +
+    newState.cashBalance
+
+  newState.strategyMemory = memory
+  return newState
+}
+
+/**
+ * Strategy: Dip Buying (5-State Machine)
+ * Scale into QLD as QQQ drawdowns reach -10%, -20%, -30%, -40%, -50%
+ */
+export const strategyDipBuyingState: StrategyFunction = (state, marketData, config, monthIndex) => {
+  const isFirstMonth = monthIndex === 0
+  const memory = { ...(state.strategyMemory as unknown as StrategyMemory) }
+  
+  // Base Logic: Handle regular contributions to cash/assets initially
+  const newState = strategyNoRebalance(state, marketData, config, monthIndex)
+  
+  // Monitor High Water Mark for QQQ Close Price
+  const currentPrice = marketData.qqqClose
+  
+  if (isFirstMonth) {
+    memory.highWaterMark = currentPrice
+    memory.currentState = 0
+  } else {
+    if (currentPrice > (memory.highWaterMark || 0)) {
+      memory.highWaterMark = currentPrice
+    }
+  }
+  
+  const hwm = memory.highWaterMark || currentPrice
+  const drawdown = (hwm - currentPrice) / hwm
+  
+  // State Machine logic (Hardcoded default thresholds)
+  let targetState = 0
+  if (drawdown >= 0.50) targetState = 5
+  else if (drawdown >= 0.40) targetState = 4
+  else if (drawdown >= 0.30) targetState = 3
+  else if (drawdown >= 0.20) targetState = 2
+  else if (drawdown >= 0.10) targetState = 1
+  
+  const prevState = memory.currentState || 0
+  memory.currentState = targetState
+  
+  // Determine if we need to rebalance portfolio due to state change or init
+  if (targetState !== prevState || isFirstMonth) {
+    const totalVal = newState.totalValue
+    
+    // Determine allocation based on state
+    // If state = 0, use user config. If state > 0, override QLD
+    let qldTargetWeight = config.qldWeight / 100
+    if (targetState === 1) qldTargetWeight = Math.max(qldTargetWeight, 0.20)
+    if (targetState === 2) qldTargetWeight = Math.max(qldTargetWeight, 0.40)
+    if (targetState === 3) qldTargetWeight = Math.max(qldTargetWeight, 0.60)
+    if (targetState === 4) qldTargetWeight = Math.max(qldTargetWeight, 0.80)
+    if (targetState === 5) qldTargetWeight = Math.max(qldTargetWeight, 1.00)
+    
+    const cashTargetWeight =
+      targetState === 0
+        ? Math.max(
+            0,
+            100 - config.qqqWeight - config.qldWeight - (config.customWeight ?? 0),
+          ) / 100
+        : 0
+    const qqqTargetWeight = Math.max(0, 1.0 - qldTargetWeight - cashTargetWeight)
+    
+    newState.shares.QLD = (totalVal * qldTargetWeight) / marketData.qldClose
+    newState.shares.QQQ = (totalVal * qqqTargetWeight) / marketData.qqqClose
+    newState.cashBalance = totalVal * cashTargetWeight
+    
+    if (!isFirstMonth) {
+      if (targetState > prevState) {
+        memory.lastAction = `Dip Buy: Entered State ${targetState} (DD: -${(drawdown*100).toFixed(1)}%)`
+      } else if (targetState < prevState) {
+        memory.lastAction = `Recovery: Reduced to State ${targetState} (DD: -${(drawdown*100).toFixed(1)}%)`
+      }
+    }
+  }
+  
+  const customValueDip =
+    marketData.customClose && marketData.customClose > 0
+      ? (newState.shares.CUSTOM ?? 0) * marketData.customClose
+      : 0
+  newState.totalValue =
+    newState.shares.QQQ * marketData.qqqClose +
+    newState.shares.QLD * marketData.qldClose +
+    customValueDip +
     newState.cashBalance
 
   newState.strategyMemory = memory
@@ -406,6 +538,8 @@ export const getStrategyByType = (type: StrategyType): StrategyFunction => {
       return strategyFlexible1
     case 'FLEXIBLE_2':
       return strategyFlexible2
+    case 'DIP_BUYING_STATE':
+      return strategyDipBuyingState
     default:
       return strategyNoRebalance
   }

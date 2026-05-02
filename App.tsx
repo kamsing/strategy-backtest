@@ -1,13 +1,14 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Analytics } from '@vercel/analytics/react'
 import { ConfigPanel } from './components/ConfigPanel'
 import { ResultsDashboard } from './components/ResultsDashboard'
 import { MarketMonitor } from './components/MarketMonitor'
 import { FinancialReportModal } from './components/FinancialReportModal'
-import { MARKET_DATA } from './constants'
+import { MARKET_DATA, buildMarketDataWithCustom } from './constants'
 import { runBacktest } from './services/simulationEngine'
 import { getStrategyByType } from './services/strategies'
-import { AssetConfig, Profile, SimulationResult } from './types'
+import { fetchTickerMonthlyData, refetchTickerMonthlyData } from './services/marketDataService'
+import { AssetConfig, MarketDataRow, Profile, SimulationResult } from './types'
 import {
   LayoutDashboard,
   Settings2,
@@ -114,6 +115,15 @@ const MainApp = () => {
   })
   const [isCalculating, setIsCalculating] = useState(false)
 
+  // 自定义标的历史数据缓存：key=symbol, value=已护取的历史数据
+  const [customMarketDataMap, setCustomMarketDataMap] = useState<
+    Record<string, ReturnType<typeof buildMarketDataWithCustom>>
+  >({})
+  const [fetchingSymbols, setFetchingSymbols] = useState<Set<string>>(new Set())
+  const [fetchErrors, setFetchErrors] = useState<Record<string, string>>({})
+  // 使用 ref 跟踪当前已经加载过的标的，防止重复请求
+  const loadedSymbolsRef = useRef<Set<string>>(new Set())
+
   // Reporting Modal State
   const [reportResult, setReportResult] = useState<SimulationResult | null>(null)
 
@@ -176,18 +186,111 @@ const MainApp = () => {
     }
   }, [profiles])
 
+  // 监听配置方案中的 customSymbol 变化，自动抓取历史数据
+  useEffect(() => {
+    const symbolsToFetch = new Set<string>()
+    profiles.forEach((profile) => {
+      const sym = profile.config.customSymbol?.toUpperCase().trim()
+      if (sym && !loadedSymbolsRef.current.has(sym) && !fetchingSymbols.has(sym)) {
+        symbolsToFetch.add(sym)
+      }
+    })
+
+    if (symbolsToFetch.size === 0) return
+
+    const fetchAll = async () => {
+      setFetchingSymbols((prev) => new Set([...prev, ...symbolsToFetch]))
+
+      await Promise.allSettled(
+        Array.from(symbolsToFetch).map(async (sym) => {
+          try {
+            const rawData = await fetchTickerMonthlyData(sym)
+            const mergedData = buildMarketDataWithCustom(rawData)
+            setCustomMarketDataMap((prev) => ({ ...prev, [sym]: mergedData }))
+            setFetchErrors((prev) => {
+              const next = { ...prev }
+              delete next[sym]
+              return next
+            })
+            loadedSymbolsRef.current.add(sym)
+          } catch (err) {
+            setFetchErrors((prev) => ({ ...prev, [sym]: (err as Error).message }))
+            loadedSymbolsRef.current.add(sym) // 防止无限重试
+          } finally {
+            setFetchingSymbols((prev) => {
+              const next = new Set(prev)
+              next.delete(sym)
+              return next
+            })
+          }
+        }),
+      )
+    }
+
+    fetchAll()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profiles])
+
+  // ----------------------------------------------------------------
+  // 手动重试抓取指定标的的历史数据
+  // 清除缓存 → 从 loadedSymbolsRef 移除 → 重新触发 useEffect
+  // ----------------------------------------------------------------
+  const handleRefetchSymbol = useCallback(
+    async (symbol: string) => {
+      const upperSym = symbol.toUpperCase().trim()
+      if (!upperSym) return
+
+      // 1. 将该 symbol 从「已尝试」集合中移除，允许重新触发
+      loadedSymbolsRef.current.delete(upperSym)
+
+      // 2. 标记为正在加载
+      setFetchingSymbols((prev) => new Set([...prev, upperSym]))
+      setFetchErrors((prev) => {
+        const next = { ...prev }
+        delete next[upperSym]
+        return next
+      })
+
+      try {
+        // 3. 强制清缓存后重新抓取（4级回退策略）
+        const rawData = await refetchTickerMonthlyData(upperSym)
+        const mergedData = buildMarketDataWithCustom(rawData)
+        setCustomMarketDataMap((prev) => ({ ...prev, [upperSym]: mergedData }))
+        loadedSymbolsRef.current.add(upperSym)
+      } catch (err) {
+        setFetchErrors((prev) => ({ ...prev, [upperSym]: (err as Error).message }))
+        loadedSymbolsRef.current.add(upperSym)
+      } finally {
+        setFetchingSymbols((prev) => {
+          const next = new Set(prev)
+          next.delete(upperSym)
+          return next
+        })
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
   const handleRunSimulation = useCallback(() => {
     setIsCalculating(true)
 
-    // Using setTimeout to allow UI to render the "Calculating" state before heavy CPU task
+    // 使用 setTimeout 让 UI 先渲染“计算中”状态
     setTimeout(() => {
-      const newResults = []
+      const newResults: SimulationResult[] = []
 
-      // 1. Run Strategy Backtests
+      // 1. 运行策略回测
       profiles.forEach((profile) => {
         const strategyFunc = getStrategyByType(profile.strategyType)
+        // 选择市场数据：如果有自定义标的，使用合并后的数据集
+        const sym = profile.config.customSymbol?.toUpperCase().trim()
+        const marketDataToUse: MarketDataRow[] =
+          sym && customMarketDataMap[sym] && customMarketDataMap[sym].length > 0
+            ? customMarketDataMap[sym]
+            : MARKET_DATA
+
         newResults.push(
-          runBacktest(MARKET_DATA, strategyFunc, profile.config, profile.name, profile.color),
+          runBacktest(marketDataToUse, strategyFunc, profile.config, profile.name, profile.color),
         )
       })
 
@@ -432,6 +535,9 @@ const MainApp = () => {
               hasResults={isCalculated}
               showBenchmark={showBenchmarks}
               onShowBenchmarkChange={setShowBenchmarks}
+              fetchingSymbols={fetchingSymbols}
+              fetchErrors={fetchErrors}
+              onRefetchSymbol={handleRefetchSymbol}
             />
 
             <div className="mt-8 px-2 text-xs text-slate-400 leading-relaxed hidden lg:block">
