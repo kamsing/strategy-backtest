@@ -124,12 +124,13 @@ const parseYahooResponse = (jsonData: YahooChartResponse): TickerMonthlyData[] =
   return Array.from(monthMap.values()).sort((a, b) => a.month.localeCompare(b.month))
 }
 
-// 尝试从 Yahoo Finance 直连获取数据
+// 尝试从 Yahoo Finance 获取数据（通过本地代理绕过 CORS）
 const fetchFromYahooDirect = async (symbol: string): Promise<TickerMonthlyData[]> => {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1mo&range=max&includeAdjustedClose=true`
+  // 使用 Vite 配置的代理路径
+  const url = `/api-yahoo/v8/finance/chart/${symbol}?interval=1mo&range=max&includeAdjustedClose=true`
   const resp = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0' },
-    signal: AbortSignal.timeout(8000), // 8秒超时
+    signal: AbortSignal.timeout(8000), 
   })
   if (!resp.ok) throw new Error(`Yahoo 直连失败: HTTP ${resp.status}`)
   const json: YahooChartResponse = await resp.json()
@@ -138,12 +139,12 @@ const fetchFromYahooDirect = async (symbol: string): Promise<TickerMonthlyData[]
   return data
 }
 
-// 尝试通过 allorigins 代理访问 Yahoo Finance
+// 备用：尝试通过 allorigins 代理访问 Yahoo Finance（如果本地代理失败）
 const fetchFromYahooProxy = async (symbol: string): Promise<TickerMonthlyData[]> => {
   const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1mo&range=max`
   const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`
   const resp = await fetch(proxyUrl, {
-    signal: AbortSignal.timeout(12000), // 代理请求允许更长超时
+    signal: AbortSignal.timeout(12000), 
   })
   if (!resp.ok) throw new Error(`Yahoo 代理失败: HTTP ${resp.status}`)
   const wrapper: { contents: string } = await resp.json()
@@ -231,9 +232,9 @@ const fetchFromStooqProxy = async (symbol: string): Promise<TickerMonthlyData[]>
   return data
 }
 
-// 尝试直连 Stooq（部分环境下可行）
+// 尝试从 Stooq 获取数据（通过本地代理）
 const fetchFromStooqDirect = async (symbol: string): Promise<TickerMonthlyData[]> => {
-  const url = buildStooqUrl(symbol)
+  const url = `/api-stooq/q/d/l/?s=${symbol}.US&i=m`
   const resp = await fetch(url, {
     signal: AbortSignal.timeout(8000),
   })
