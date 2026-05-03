@@ -23,6 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 playwright-report/*
+test_*.js
+test_*.cjs
+*.json.backup
+download_data.py
 test-results/*
 test-results/.last-run.json
 e2e/docs/*
