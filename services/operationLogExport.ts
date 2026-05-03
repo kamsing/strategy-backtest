@@ -38,6 +38,10 @@ const rowToCSVFields = (row: OperationLogRow): string[] => {
       : '',                                              // Maintenance_Ratio_Pct（无杠杆为空）
     fmtNum(row.pledgeCumulative, 0),                    // Pledge_Cumulative
     fmtNum(row.pledgeInventoryValue, 0),                // Pledge_Inventory_Value
+    row.marketPhase || '',                              // Market_Phase (v1.1)
+    row.drawdownFromAth !== undefined
+      ? fmtSigned(row.drawdownFromAth * 100, 2)
+      : '',                                              // Drawdown_From_ATH_Pct (v1.1)
   ]
 }
 
@@ -59,6 +63,8 @@ const CSV_HEADERS = [
   'Maintenance_Ratio_Pct',
   'Pledge_Cumulative',
   'Pledge_Inventory_Value',
+  'Market_Phase',
+  'Drawdown_From_ATH_Pct',
 ]
 
 // 将字段数组转为 CSV 行字符串（处理含逗号和引号的字段）

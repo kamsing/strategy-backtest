@@ -8,24 +8,15 @@ import {
   calcOperationLogSummary,
 } from '../services/operationLogService'
 import { exportOperationLogCSV } from '../services/operationLogExport'
+import { getMarketPhaseConfig } from '../services/marketCycleService'
+import { MarketPhaseLabel } from '../types'
 
 interface FinancialReportModalProps {
   result: SimulationResult
   onClose: () => void
 }
 
-// 事件类型对应的行背景色（PRD §2.3）
-const ROW_BG: Record<string, string> = {
-  ROTATION_IN: 'bg-yellow-50',
-  ROTATION_OUT: 'bg-green-50',
-  PLEDGE_BORROW: 'bg-orange-50',
-  PLEDGE_REPAY: 'bg-blue-50',
-  WITHDRAW: 'bg-purple-50',
-  DEBT_INC: 'bg-red-50',
-  INTEREST_EXP: 'bg-orange-50',
-  INFO: 'bg-red-100',
-  INITIAL: 'bg-slate-100',
-}
+
 
 // 事件类型对应的 Badge 样式
 const BADGE_STYLE: Record<string, string> = {
@@ -61,6 +52,7 @@ const OperationLogTable: React.FC<{
   const [filterType, setFilterType] = useState<string>('all')
   const [filterYear, setFilterYear] = useState<string>('all')
   const [filterGroup, setFilterGroup] = useState<string>('all')
+  const [filterPhase, setFilterPhase] = useState<string>('all')
   const [isExporting, setIsExporting] = useState(false)
   const [sortAsc, setSortAsc] = useState(true)
 
@@ -96,9 +88,12 @@ const OperationLogTable: React.FC<{
     if (filterGroup !== 'all') {
       rows = rows.filter((r) => r.groupLabel === filterGroup)
     }
+    if (filterPhase !== 'all') {
+      rows = rows.filter((r) => r.marketPhase === filterPhase)
+    }
     // 排序
     return sortAsc ? rows : [...rows].reverse()
-  }, [allRows, filterType, filterYear, filterGroup, sortAsc])
+  }, [allRows, filterType, filterYear, filterGroup, filterPhase, sortAsc])
 
   const summary = useMemo(() => calcOperationLogSummary(filteredRows), [filteredRows])
 
@@ -151,6 +146,27 @@ const OperationLogTable: React.FC<{
           <option value="回到高点">回到高点</option>
         </select>
 
+        <select
+          value={filterPhase}
+          onChange={(e) => setFilterPhase(e.target.value)}
+          className="text-xs border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-700"
+        >
+          <option value="all">全部市场状态</option>
+          <option value="PHASE_ALERT">市场预警</option>
+          <option value="PHASE_CORRECTION">市场调整</option>
+          <option value="PHASE_BEAR">熊市</option>
+          <option value="PHASE_FINANCIAL_CRISIS">金融海啸</option>
+          <option value="PHASE_FINANCIAL_STORM">金融风暴</option>
+          <option value="PHASE_CATASTROPHE">市场崩溃</option>
+          <option value="PHASE_STABILIZE">企稳</option>
+          <option value="PHASE_REBOUND">技术反弹</option>
+          <option value="PHASE_BULL">牛市</option>
+          <option value="PHASE_STRONG_BULL">强势牛市</option>
+          <option value="PHASE_NEW_ATH">历史新高</option>
+          <option value="PHASE_EUPHORIA">市场亢奋</option>
+          <option value="PHASE_NORMAL">正常运行</option>
+        </select>
+
         <button
           onClick={() => setSortAsc(!sortAsc)}
           className="text-xs border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-700 hover:bg-slate-50"
@@ -190,8 +206,9 @@ const OperationLogTable: React.FC<{
         <table className="w-full text-xs text-left min-w-[1100px]">
           <thead className="bg-slate-100 text-slate-500 uppercase font-bold sticky top-0 z-10">
             <tr>
-              <th className="px-3 py-2 whitespace-nowrap">日期</th>
-              <th className="px-3 py-2 whitespace-nowrap">状态</th>
+              <th className="px-3 py-2 whitespace-nowrap w-[110px]">日期</th>
+              <th className="px-3 py-2 whitespace-nowrap w-[120px]">市场状态</th>
+              <th className="px-3 py-2 whitespace-nowrap w-[100px]">操作类型</th>
               <th className="px-3 py-2 text-right whitespace-nowrap">涨跌%</th>
               <th className="px-3 py-2 text-right whitespace-nowrap">异动%</th>
               <th className="px-3 py-2 text-right whitespace-nowrap">QQQ股价</th>
@@ -207,7 +224,8 @@ const OperationLogTable: React.FC<{
           </thead>
           <tbody className="divide-y divide-slate-100">
             {filteredRows.map((row, idx) => {
-              const bg = ROW_BG[row.status] ?? 'bg-white'
+              const phaseConfig = getMarketPhaseConfig(row.marketPhase as MarketPhaseLabel)
+              const bg = phaseConfig.rowBgClass || 'bg-white'
               const badge = BADGE_STYLE[row.status] ?? 'bg-slate-100 text-slate-600'
               const isInfo = row.status === 'INFO'
               // 维持率 < 130% 标红（PRD C7）
@@ -217,8 +235,19 @@ const OperationLogTable: React.FC<{
               return (
                 <tr key={idx} className={`${bg} hover:brightness-95 transition-all`}>
                   <td className="px-3 py-2 font-mono text-slate-600 whitespace-nowrap">{row.date}</td>
+                  {/* 市场状态列（独立） */}
                   <td className="px-3 py-2 whitespace-nowrap">
-                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${badge} ${isInfo ? 'text-red-600' : ''}`}>
+                    {row.marketPhase ? (
+                      <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-bold ${phaseConfig.badgeClass}`}>
+                        {phaseConfig.emoji} {phaseConfig.label}
+                      </span>
+                    ) : (
+                      <span className="text-slate-300">—</span>
+                    )}
+                  </td>
+                  {/* 操作类型列（独立） */}
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-bold ${badge} ${isInfo ? 'text-red-600' : ''}`}>
                       {row.statusCN}
                     </span>
                   </td>

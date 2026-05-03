@@ -17,6 +17,7 @@ import {
   calculateRealValue,
   calculateUlcerIndex,
 } from './financeMath'
+import { resolveMarketPhase, resolveCyclePhase, resolveSidewaysMonths, getMarketPhaseConfig } from './marketCycleService'
 
 /**
  * 从市场数据行中获取指定标的的收盘价
@@ -131,9 +132,13 @@ export const runBacktest = (
     ltv: 0,
     beta: 0,
     events: [],
+    // v1.1 新增：初始化市场阶段与周期
+    marketPhase: 'PHASE_INITIAL',
+    cyclePhase: 'CYCLE_NEW_HIGH',
+    drawdownFromAth: 0,
+    ath: 0,
   }
 
-  const monthlyCashYieldRate = Math.pow(1 + config.cashYieldAnnual / 100, 1 / 12) - 1
 
   // 债务配置
   const leverage = {
@@ -144,8 +149,10 @@ export const runBacktest = (
     ltvBasis: config.leverage?.ltvBasis ?? 'TOTAL_ASSETS',
   }
 
-  const monthlyLoanRate = leverage.enabled
-    ? Math.pow(1 + leverage.interestRate / 100, 1 / 12) - 1
+  // 利率计算调整为日利率 (Issue #1)
+  const dailyCashYieldRate = Math.pow(1 + config.cashYieldAnnual / 100, 1 / 365) - 1
+  const dailyLoanRate = leverage.enabled
+    ? Math.pow(1 + leverage.interestRate / 100, 1 / 365) - 1
     : 0
 
   let isBankrupt = false
@@ -168,23 +175,31 @@ export const runBacktest = (
       continue
     }
 
+    const prevDateStr = index > 0 ? marketData[index - 1].date : null
+    const isNewMonth = index === 0 || (prevDateStr !== null && dataRow.date.substring(0, 7) !== prevDateStr.substring(0, 7))
+    const daysDiff = index > 0 && prevDateStr !== null 
+      ? Math.max(1, Math.round((new Date(dataRow.date).getTime() - new Date(prevDateStr).getTime()) / (1000 * 3600 * 24)))
+      : 0
+
     // 1. 银行计息：现金利息收入 & 债务利息计算
     if (index > 0) {
-      // Step A: 现金利息收入
-      const interestEarned = currentState.cashBalance * monthlyCashYieldRate
+
+      // Step A: 现金利息收入 (按天复利)
+      const interestEarned = currentState.cashBalance * (Math.pow(1 + dailyCashYieldRate, daysDiff) - 1)
       if (interestEarned > 0.01) {
         currentState.cashBalance += interestEarned
         monthEvents.push({
           type: 'INTEREST_INC',
           amount: interestEarned,
-          description: `Cash Interest (+${(config.cashYieldAnnual / 12).toFixed(2)}%)`,
+          date: dataRow.date,
+          description: `Cash Interest (Daily Compound x${daysDiff})`,
         })
       }
 
       // Step B: 计算债务利息
       let interestDue = 0
       if (leverage.enabled && currentState.debtBalance > 0) {
-        interestDue = currentState.debtBalance * monthlyLoanRate
+        interestDue = currentState.debtBalance * (Math.pow(1 + dailyLoanRate, daysDiff) - 1)
       }
 
       // Step C: 处理债务利息（三种模式）
@@ -242,11 +257,11 @@ export const runBacktest = (
     const cashBeforeStrat = currentState.cashBalance
     const sharesBeforeStrat = { ...currentState.shares }
 
-    // Clear events so strategy can push its own custom events for this month
+    // 清除上个数据点的临时事件
     currentState.events = []
     currentState = strategyFunc(currentState, dataRow, config, index)
 
-    // 检测交易（通过持仓变化推断）
+    // 2.5 检测交易（通过持仓变化推断）
     // 策略自身已推送的 TRADE/ROTATION/PLEDGE 事件不重复统计
     const hasExplicitTrade = currentState.events?.some(
       (e) => e.type === 'ROTATION_IN' || e.type === 'ROTATION_OUT' || e.type === 'PLEDGE_BORROW' || e.type === 'PLEDGE_REPAY'
@@ -293,19 +308,17 @@ export const runBacktest = (
       netTradeCost += diff * price
     }
     const impliedCashFlow = currentState.cashBalance - cashBeforeStrat + netTradeCost
-    if (impliedCashFlow > 1.0) {
+    // 仅在跨月时记录定投事件，避免每日数据下的重复显示
+    if (isNewMonth && impliedCashFlow > 1.0) {
       monthEvents.push({
         type: 'DEPOSIT',
         amount: impliedCashFlow,
-        description: 'Recurring Contribution / Deposit',
+        description: 'Monthly Recurring Contribution',
       })
     }
 
     // 3. 杠杆/质押逻辑（借款、提取 & 偿债检查）
     if (leverage.enabled) {
-      const currentMonth = parseInt(dataRow.date.substring(5, 7)) - 1
-
-      // 使用低价进行保证金评估
       const qqqValue = getShareValue(currentState.shares, 'QQQ', dataRow.qqqLow)
       const qldValue = getShareValue(currentState.shares, 'QLD', dataRow.qldLow)
       const cashValue = currentState.cashBalance
@@ -331,31 +344,41 @@ export const runBacktest = (
         cashValue * leverage.cashPledgeRatio +
         qldValue * leverage.qldPledgeRatio
 
-      // 年度提取（首月 or 每年1月）
-      const isWithdrawalTiming = index === 0 || currentMonth === 0
+      // 提取生活费逻辑：仅在跨月时触发 (PRD §4.3)
+      if (isNewMonth && index > 0 && leverage.withdrawValue > 0) {
+        const currDate = new Date(dataRow.date)
+        const currentMonth = currDate.getUTCMonth()
+        
+        // 年度提取（每年 1 月或首月）
+        const isWithdrawalTiming = index === 0 || currentMonth === 0
+        
+        if (isWithdrawalTiming) {
+          // 估算年限 (处理每日数据或每月数据)
+          const yearsPassed = Math.floor(index / (marketData.length / 25)) // 粗略估算
+          let borrowAmount = 0
+          
+          if (leverage.withdrawType === 'PERCENT') {
+            borrowAmount = totalAssetValue * (leverage.withdrawValue / 100)
+          } else if (leverage.withdrawType === 'FIXED') {
+            borrowAmount = leverage.withdrawValue
+          } else if (leverage.withdrawType === 'INFLATION_ADJUSTED') {
+            const inflationFactor = Math.pow(1 + (leverage.inflationRate || 0) / 100, yearsPassed)
+            borrowAmount = leverage.withdrawValue * inflationFactor
+          }
 
-      if (isWithdrawalTiming && effectiveCollateral > 0) {
-        let borrowAmount = 0
-        if (leverage.withdrawType === 'PERCENT') {
-          borrowAmount = totalAssetValue * (leverage.withdrawValue / 100)
-        } else {
-          const yearsPassed = Math.floor(index / 12)
-          const inflationFactor = Math.pow(1 + (leverage.inflationRate || 0) / 100, yearsPassed)
-          borrowAmount = leverage.withdrawValue * inflationFactor
-        }
-
-        if (borrowAmount > 0) {
-          currentState.debtBalance += borrowAmount
-          monthEvents.push({
-            type: 'WITHDRAW',
-            amount: -borrowAmount,
-            description: index === 0 ? `Initial Loan Withdrawal` : `Annual Living Expense Withdrawal`,
-          })
-          monthEvents.push({
-            type: 'DEBT_INC',
-            amount: borrowAmount,
-            description: `Borrowing increased for withdrawal`,
-          })
+          if (borrowAmount > 0) {
+            currentState.debtBalance += borrowAmount
+            monthEvents.push({
+              type: 'WITHDRAW',
+              amount: -borrowAmount,
+              description: index === 0 ? `Initial Loan Withdrawal` : `Annual Living Expense Withdrawal`,
+            })
+            monthEvents.push({
+              type: 'DEBT_INC',
+              amount: borrowAmount,
+              description: `Borrowing increased for withdrawal`,
+            })
+          }
         }
       }
 
@@ -417,7 +440,56 @@ export const runBacktest = (
       currentState.beta = calcBeta(currentState.shares, dataRow, currentState.totalValue)
     }
 
-    // 5. 推导分组标签（PRD §5.3）
+    // 5. 市场周期与阶段解析 (PRD v1.1 §7.1)
+    if (!isBankrupt) {
+      // 更新 ATH
+      const currentAth = Math.max(currentState.ath || 0, currentState.totalValue)
+      
+      // 计算距 ATH 跌幅
+      const drawdownFromAth = currentAth > 0
+        ? (currentState.totalValue / currentAth) - 1
+        : 0
+      
+      // 计算距低点涨幅（需维护 trough 在 strategyMemory 或本地变量，这里从历史中简单推导或使用 memory）
+      let trough = (currentState.strategyMemory.cycleTrough as number) ?? currentState.totalValue
+      if (currentState.totalValue < trough) {
+        trough = currentState.totalValue
+        currentState.strategyMemory.cycleTrough = trough
+      }
+      const recoveryFromTrough = trough > 0
+        ? (currentState.totalValue / trough) - 1
+        : 0
+      
+      // 计算横盘月数
+      const sidewaysMonths = resolveSidewaysMonths(history, index)
+      
+      // 解析阶段
+      currentState.marketPhase = resolveMarketPhase(drawdownFromAth, recoveryFromTrough, index === 0, sidewaysMonths)
+      currentState.cyclePhase = resolveCyclePhase(drawdownFromAth, recoveryFromTrough, currentAth, currentState.totalValue, currentState.cyclePhase || 'CYCLE_NEW_HIGH')
+      currentState.ath = currentAth
+      currentState.drawdownFromAth = drawdownFromAth
+
+      // v1.1 §4.4：通知触发逻辑
+      const lastNotified = currentState.strategyMemory.lastNotifiedPhase as string
+      const highPriorityPhases = new Set([
+        'PHASE_ALERT', 'PHASE_CORRECTION', 'PHASE_BEAR', 
+        'PHASE_FINANCIAL_CRISIS', 'PHASE_FINANCIAL_STORM', 'PHASE_CATASTROPHE',
+        'PHASE_NEW_ATH', 'PHASE_EUPHORIA'
+      ])
+
+      if (currentState.marketPhase !== lastNotified && highPriorityPhases.has(currentState.marketPhase)) {
+        const phaseConfig = getMarketPhaseConfig(currentState.marketPhase)
+        monthEvents.push({
+          type: 'ALERT_SENT',
+          date: dataRow.date,
+          description: `${phaseConfig.emoji} 系统通知：市场进入 ${phaseConfig.label} 阶段`,
+          marketPhase: currentState.marketPhase,
+        })
+        currentState.strategyMemory.lastNotifiedPhase = currentState.marketPhase
+      }
+    }
+
+    // 6. 推导分组标签（PRD §5.3 - 兼容 v1.0）
     const bp = (currentState.strategyMemory.bearPhase as number) ?? 0
     const rp = (currentState.strategyMemory.recoveryPhase as number) ?? 0
     const hwmVal = (currentState.strategyMemory.hwm as number) ?? Infinity
@@ -432,12 +504,18 @@ export const runBacktest = (
       groupLabel = '正常运行'
     }
 
-    // 6. 记录历史
+    // 7. 记录历史
+    const finalEvents = [...monthEvents, ...(currentState.events || [])].map(evt => ({
+      ...evt,
+      date: evt.date || dataRow.date, // 确保所有事件都有日期
+      marketPhase: evt.marketPhase || currentState.marketPhase, // 注入当前市场阶段
+    }))
+
     history.push({
       ...currentState,
       shares: { ...currentState.shares },
       strategyMemory: { ...currentState.strategyMemory },
-      events: [...monthEvents, ...(currentState.events || [])],
+      events: finalEvents,
       groupLabel,
     })
   }

@@ -5,26 +5,30 @@
 
 import { SimulationResult, MarketDataRow, FinancialEvent } from '../types'
 
-// OperationLogRow 接口（PRD §2.7）
+// OperationLogRow 接口（PRD v1.1 §4.5）
 export interface OperationLogRow {
-  date: string             // 格式：YYYY-MM
+  date: string             // 格式：YYYY-MM-DD
   status: string           // 原始 event.type
   statusCN: string         // 中文映射
-  qqqPrice: number         // QQQ 当月收盘价
-  changePct: number        // QQQ 当月涨跌幅（百分比）
-  phasePct: number         // 阶段触发阈值%（如 -10, -20...）
-  sharesChanged: number | null  // 本次操作股数（正=买入，负=卖出，null=无持仓变动）
-  amount: number           // 操作金额（正=买入，负=卖出）
-  sharesAfter: number      // 操作后主要标的持仓股数
-  stockValue: number       // 操作后所有股票合计市值
-  totalAssets: number      // 操作后总资产（股票市值 + 现金）
-  pnl: number              // 净值相对初始资金的绝对损益
-  pnlPct: number           // 净值相对初始资金的百分比损益
-  maintenanceRatioPct: number | null  // 维持率（无杠杆时为 null）
-  pledgeCumulative: number // 质押借款累积债务余额
-  pledgeInventoryValue: number  // 当前质押仓位合计市值
+  qqqPrice: number         // QQQ 收盘价
+  changePct: number        // QQQ 涨跌幅（百分比）
+  phasePct: number         // 阶段触发阈值%
+  sharesChanged: number | null  // 本次操作股数
+  amount: number           // 操作金额
+  sharesAfter: number      // 操作后持仓股数
+  stockValue: number       // 操作后合计市值
+  totalAssets: number      // 操作后总资产
+  pnl: number              // 累计损益
+  pnlPct: number           // 累计损益%
+  maintenanceRatioPct: number | null  // 维持率
+  pledgeCumulative: number // 累积债务
+  pledgeInventoryValue: number  // 质押市值
   groupLabel: string       // 分组标签
   ticker: string           // 操作标的
+  // v1.1 新增
+  marketPhase?: string     // 市场阶段（如：PHASE_BEAR）
+  drawdownFromAth?: number    // 距 ATH 跌幅
+  recoveryFromTrough?: number // 距低点涨幅
 }
 
 // 事件类型到中文名称的映射（PRD §2.3）
@@ -141,11 +145,11 @@ export function buildOperationLogRows(
 
     const groupLabel = state.groupLabel ?? '正常运行'
 
-    // 第一行（初始建仓）—— 即使无事件也必须存在（PRD C2）
+    // 第一行（初始建仓）
     if (i === 0) {
       const initAmount = initialCapital
       rows.push({
-        date: dateMonth,
+        date: state.date, // YYYY-MM-DD
         status: 'INITIAL',
         statusCN: '初始建仓',
         qqqPrice: qqqClose,
@@ -163,6 +167,9 @@ export function buildOperationLogRows(
         pledgeInventoryValue,
         groupLabel,
         ticker: 'QQQ',
+        marketPhase: state.marketPhase,
+        drawdownFromAth: state.drawdownFromAth,
+        recoveryFromTrough: 0,
       })
       continue
     }
@@ -172,6 +179,10 @@ export function buildOperationLogRows(
       // 跳过纯噪音事件
       if (evt.type === 'INTEREST_INC' && Math.abs(evt.amount ?? 0) < 100) return false
       if (evt.type === 'ALERT_SENT') return false
+      // Bug修复(#5)：定投设为0时，DEPOSIT事件金额几乎为0，过滤掉
+      if (evt.type === 'DEPOSIT' && Math.abs(evt.amount ?? 0) < 1) return false
+      // 过滤掉金额极小的TRADE事件（由定投为0触发的误报）
+      if (evt.type === 'TRADE' && Math.abs(evt.amount ?? 0) < 1 && Math.abs(evt.sharesChanged ?? 0) < 0.001) return false
       return true
     })
 
@@ -188,7 +199,7 @@ export function buildOperationLogRows(
       const mainTicker = event.ticker ?? 'QQQ'
       const sharesAfter = state.shares[mainTicker] ?? state.shares['QQQ'] ?? 0
 
-      // 操作金额（amount）标准化：TRADE 事件 amount = -cost，正值表示卖出收入
+      // 操作金额标准化
       const amount = event.amount ?? 0
 
       // 中文状态
@@ -198,7 +209,7 @@ export function buildOperationLogRows(
       }
 
       rows.push({
-        date: dateMonth,
+        date: event.date || state.date, // v1.1: 优先使用事件的精确日期
         status: event.type,
         statusCN,
         qqqPrice: qqqClose,
@@ -216,6 +227,9 @@ export function buildOperationLogRows(
         pledgeInventoryValue,
         groupLabel,
         ticker: mainTicker,
+        marketPhase: event.marketPhase || state.marketPhase,
+        drawdownFromAth: event.drawdownFromAth ?? state.drawdownFromAth,
+        recoveryFromTrough: event.recoveryFromTrough ?? 0,
       })
     }
   }

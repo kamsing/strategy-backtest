@@ -113,6 +113,42 @@ export interface Profile {
   config: AssetConfig
 }
 
+// v1.1 新增：市场阶段标签
+export type MarketPhaseLabel =
+  | 'PHASE_INITIAL'        // 周期初始状态（建仓月）
+  | 'PHASE_ALERT'          // 市场预警（跌幅 -5% ~ -9%）
+  | 'PHASE_CORRECTION'     // 市场调整（跌幅 -10% ~ -19%）
+  | 'PHASE_BEAR'           // 熊市（跌幅 -20% ~ -29%）
+  | 'PHASE_FINANCIAL_CRISIS' // 金融海啸（跌幅 -30% ~ -39%）
+  | 'PHASE_FINANCIAL_STORM'  // 金融风暴（跌幅 -40% ~ -49%）
+  | 'PHASE_CATASTROPHE'    // 市场崩溃（跌幅 ≥ -50%）
+  | 'PHASE_STABILIZE'      // 企稳（从低点反弹 +5% ~ +9%）
+  | 'PHASE_REBOUND'        // 技术反弹（+10% ~ +19%，低点起算）
+  | 'PHASE_BULL'           // 牛市确认（+20% ~ +29%，低点起算）
+  | 'PHASE_STRONG_BULL'    // 强势牛市（+30% ~ +49%，低点起算）
+  | 'PHASE_NEW_ATH'        // 创历史新高（突破前高 ATH）
+  | 'PHASE_EUPHORIA'       // 市场亢奋（创新高后继续上涨 +20% 以上）
+  | 'PHASE_NORMAL'         // 正常运行（波动 ±5% 以内，无显著趋势）
+  | 'PHASE_SIDEWAYS'       // 横盘整理（区间震荡超过 3 个月）
+
+// v1.1 新增：市场周期状态
+export type CyclePhase =
+  | 'CYCLE_PEAK'     // 周期高点
+  | 'CYCLE_DRAWDOWN' // 下行阶段
+  | 'CYCLE_RECOVERY' // 周期修复
+  | 'CYCLE_NEW_HIGH' // 新周期开始
+
+// v1.1 新增：周期分段结构
+export interface CycleSegment {
+  startDate: string   // YYYY-MM-DD
+  endDate: string     // YYYY-MM-DD
+  type: CyclePhase
+  peakValue?: number  // 对应高点净值
+  troughValue?: number // 对应低点净值
+  drawdownPct?: number // 最大回撤%
+  recoveryPct?: number // 反弹幅度%
+}
+
 export interface FinancialEvent {
   type:
     | 'INTEREST_INC'
@@ -133,6 +169,12 @@ export interface FinancialEvent {
   ticker?: string         // 操作涉及的标的代码（如 'QQQ', 'TQQQ'）
   phasePct?: number       // 触发的阈值百分比（如 -10, -20, +10...）
   sharesChanged?: number  // 本次操作的股数变化（正=买入，负=卖出）
+  
+  // v1.1 新增：精确日期与市场阶段（PRD §2.3, §4.2）
+  date?: string                  // YYYY-MM-DD，精确到操作执行日
+  marketPhase?: MarketPhaseLabel // 事件发生时的市场阶段
+  drawdownFromAth?: number       // 距 ATH 的跌幅（负数）
+  recoveryFromTrough?: number    // 距低点的涨幅（正数）
 }
 
 export interface PortfolioState {
@@ -156,6 +198,12 @@ export interface PortfolioState {
   // PRD §4：操作记录分组标签（可选，向下兼容）
   // 值：'正常运行' | '下跌加码' | '上涨减码' | '回到高点'
   groupLabel?: string
+
+  // v1.1 新增：市场阶段与周期信息（PRD §5.2）
+  marketPhase?: MarketPhaseLabel   // 默认 PHASE_NORMAL
+  cyclePhase?: CyclePhase          // 默认 CYCLE_NEW_HIGH (首月)
+  drawdownFromAth?: number         // 当月距 ATH 跌幅
+  ath?: number                     // 截至当月的历史最高净值
 }
 
 export interface SimulationResult {

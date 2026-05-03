@@ -4,10 +4,11 @@ import { ConfigPanel } from './components/ConfigPanel'
 import { ResultsDashboard } from './components/ResultsDashboard'
 import { MarketMonitor } from './components/MarketMonitor'
 import { FinancialReportModal } from './components/FinancialReportModal'
-import { MARKET_DATA, buildMarketDataWithCustom } from './constants'
+import { PriceUpdatePanel } from './components/PriceUpdatePanel'
+import { MARKET_DATA, buildMarketDataWithCustom, getExtendedMarketData } from './constants'
 import { runBacktest } from './services/simulationEngine'
 import { getStrategyByType } from './services/strategies'
-import { fetchTickerMonthlyData, refetchTickerMonthlyData } from './services/marketDataService'
+import { fetchTickerHistoryData, refetchTickerHistoryData } from './services/marketDataService'
 import { AssetConfig, MarketDataRow, Profile, SimulationResult } from './types'
 import {
   LayoutDashboard,
@@ -17,6 +18,7 @@ import {
   PanelLeftOpen,
   Activity,
   LineChart,
+  Database,
 } from 'lucide-react'
 import { LanguageProvider, useTranslation, Language } from './services/i18n'
 import { version } from './package.json'
@@ -108,6 +110,7 @@ const MainApp = () => {
     return INITIAL_PROFILES
   })
   const [results, setResults] = useState<SimulationResult[]>([])
+  const [currentMarketData, setCurrentMarketData] = useState<MarketDataRow[]>(MARKET_DATA)
   const [isCalculated, setIsCalculated] = useState(false)
   const [showBenchmarks, setShowBenchmarks] = useState<boolean>(() => {
     const saved = localStorage.getItem('app_show_benchmark')
@@ -127,8 +130,8 @@ const MainApp = () => {
   // Reporting Modal State
   const [reportResult, setReportResult] = useState<SimulationResult | null>(null)
 
-  // View state: 'backtest' | 'monitor'
-  const [currentView, setCurrentView] = useState<'backtest' | 'monitor'>('backtest')
+  // View state: 'backtest' | 'monitor' | 'stocks'
+  const [currentView, setCurrentView] = useState<'backtest' | 'monitor' | 'stocks'>('backtest')
 
   // Sidebar state
   const [isSidebarOpen, setSidebarOpen] = useState(() => {
@@ -204,7 +207,7 @@ const MainApp = () => {
       await Promise.allSettled(
         Array.from(symbolsToFetch).map(async (sym) => {
           try {
-            const rawData = await fetchTickerMonthlyData(sym)
+            const rawData = await fetchTickerHistoryData(sym)
             const mergedData = buildMarketDataWithCustom(rawData)
             setCustomMarketDataMap((prev) => ({ ...prev, [sym]: mergedData }))
             setFetchErrors((prev) => {
@@ -235,6 +238,31 @@ const MainApp = () => {
   // 手动重试抓取指定标的的历史数据
   // 清除缓存 → 从 loadedSymbolsRef 移除 → 重新触发 useEffect
   // ----------------------------------------------------------------
+  const handleUpdateAllData = async () => {
+    setIsCalculating(true) // 借用计算状态显示 Loading
+    try {
+      const symbolsToUpdate = ['QQQ', 'QLD']
+      profiles.forEach(p => {
+        const sym = p.config.customSymbol?.toUpperCase().trim()
+        if (sym) symbolsToUpdate.push(sym)
+      })
+      
+      const uniqueSymbols = Array.from(new Set(symbolsToUpdate))
+      for (const symbol of uniqueSymbols) {
+        await refetchTickerHistoryData(symbol)
+      }
+      // 刷新基准行情
+      const currentFullData = getExtendedMarketData()
+      setCurrentMarketData(currentFullData)
+      
+      alert(t('dataUpdatedSuccess') || '行情数据已更新为每日精度！')
+    } catch (e) {
+      alert(t('dataUpdateError') || '更新失败: ' + (e as Error).message)
+    } finally {
+      setIsCalculating(false)
+    }
+  }
+
   const handleRefetchSymbol = useCallback(
     async (symbol: string) => {
       const upperSym = symbol.toUpperCase().trim()
@@ -253,7 +281,7 @@ const MainApp = () => {
 
       try {
         // 3. 强制清缓存后重新抓取（4级回退策略）
-        const rawData = await refetchTickerMonthlyData(upperSym)
+        const rawData = await refetchTickerHistoryData(upperSym)
         const mergedData = buildMarketDataWithCustom(rawData)
         setCustomMarketDataMap((prev) => ({ ...prev, [upperSym]: mergedData }))
         loadedSymbolsRef.current.add(upperSym)
@@ -277,84 +305,106 @@ const MainApp = () => {
 
     // 使用 setTimeout 让 UI 先渲染“计算中”状态
     setTimeout(() => {
-      const newResults: SimulationResult[] = []
+      try {
+        const newResults: SimulationResult[] = []
+        // 0. 刷新基础市场数据 (支持从本地缓存延伸日期范围)
+        const baseMarketData = getExtendedMarketData()
+        setCurrentMarketData(baseMarketData)
 
-      // 1. 运行策略回测
-      profiles.forEach((profile) => {
-        const strategyFunc = getStrategyByType(profile.strategyType)
-        // 选择市场数据：如果有自定义标的，使用合并后的数据集
-        const sym = profile.config.customSymbol?.toUpperCase().trim()
-        const marketDataToUse: MarketDataRow[] =
-          sym && customMarketDataMap[sym] && customMarketDataMap[sym].length > 0
-            ? customMarketDataMap[sym]
-            : MARKET_DATA
+        // 1. 运行策略回测
+        profiles.forEach((profile) => {
+          const strategyFunc = getStrategyByType(profile.strategyType)
+          // 选择市场数据：如果有自定义标的，使用最新的基础数据进行合并
+          const sym = profile.config.customSymbol?.toUpperCase().trim()
+          let marketDataToUse: MarketDataRow[] = baseMarketData
 
-        newResults.push(
-          runBacktest(marketDataToUse, strategyFunc, profile.config, profile.name, profile.color),
-        )
-      })
+          if (sym) {
+            // 如果 customMarketDataMap 中已有该标的的数据，确保它是基于最新的 baseMarketData 构建的
+            // 简单起见，我们从 localStorage 实时构建或使用缓存
+            const cachedCustom = localStorage.getItem(`ticker_cache_${sym}`)
+            if (cachedCustom) {
+              try {
+                const entry = JSON.parse(cachedCustom)
+                const rawData = Array.isArray(entry) ? entry : (entry.data || [])
+                marketDataToUse = buildMarketDataWithCustom(rawData, baseMarketData)
+              } catch (e) {
+                marketDataToUse = customMarketDataMap[sym] || baseMarketData
+              }
+            } else {
+              marketDataToUse = customMarketDataMap[sym] || baseMarketData
+            }
+          }
 
-      // 2. Add Benchmarks (based on the first profile's capital/contribution settings)
-      if (profiles.length > 0 && showBenchmarks) {
-        const firstProfile = profiles[0]
-        if (!firstProfile) return
-        const baseConfig = firstProfile.config
+          newResults.push(
+            runBacktest(marketDataToUse, strategyFunc, profile.config, profile.name, profile.color),
+          )
+        })
 
-        // Benchmark: QQQ (Nasdaq 100)
-        const qqqConfig: AssetConfig = {
-          ...baseConfig,
-          qqqWeight: 100,
-          qldWeight: 0,
-          contributionQqqWeight: 100,
-          contributionQldWeight: 0,
-          leverage: {
-            ...baseConfig.leverage,
-            enabled: false, // Benchmarks are unleveraged
-          },
+        // 2. Add Benchmarks (based on the first profile's capital/contribution settings)
+        if (profiles.length > 0 && showBenchmarks) {
+          const firstProfile = profiles[0]
+          if (!firstProfile) return
+          const baseConfig = firstProfile.config
+
+          // Benchmark: QQQ (Nasdaq 100)
+          const qqqConfig: AssetConfig = {
+            ...baseConfig,
+            qqqWeight: 100,
+            qldWeight: 0,
+            contributionQqqWeight: 100,
+            contributionQldWeight: 0,
+            leverage: {
+              ...baseConfig.leverage,
+              enabled: false, // Benchmarks are unleveraged
+            },
+          }
+
+          // Benchmark: QLD (2x Leveraged Nasdaq 100)
+          const qldConfig: AssetConfig = {
+            ...baseConfig,
+            qqqWeight: 0,
+            qldWeight: 100,
+            contributionQqqWeight: 0,
+            contributionQldWeight: 100,
+            leverage: {
+              ...baseConfig.leverage,
+              enabled: false, // Benchmarks are unleveraged
+            },
+          }
+
+          // Run Benchmarks (QQQ & QLD)
+          newResults.push(
+            runBacktest(
+              baseMarketData,
+              getStrategyByType('NO_REBALANCE'),
+              qqqConfig,
+              'Benchmark: QQQ',
+              '#64748b', // Slate-500
+            ),
+          )
+
+          newResults.push(
+            runBacktest(
+              baseMarketData,
+              getStrategyByType('NO_REBALANCE'),
+              qldConfig,
+              'Benchmark: QLD',
+              '#94a3b8', // Slate-400
+            ),
+          )
         }
 
-        // Benchmark: QLD (2x Leveraged Nasdaq 100)
-        const qldConfig: AssetConfig = {
-          ...baseConfig,
-          qqqWeight: 0,
-          qldWeight: 100,
-          contributionQqqWeight: 0,
-          contributionQldWeight: 100,
-          leverage: {
-            ...baseConfig.leverage,
-            enabled: false, // Benchmarks are unleveraged
-          },
+        setResults(newResults)
+        setIsCalculated(true)
+      } catch (err) {
+        console.error('Simulation failed:', err)
+        alert('Simulation failed: ' + (err as Error).message)
+      } finally {
+        setIsCalculating(false)
+        // Auto close on mobile only
+        if (window.innerWidth < 1024) {
+          setSidebarOpen(false)
         }
-
-        // Run Benchmarks (QQQ & QLD)
-        newResults.push(
-          runBacktest(
-            MARKET_DATA,
-            getStrategyByType('NO_REBALANCE'),
-            qqqConfig,
-            'Benchmark: QQQ',
-            '#64748b', // Slate-500
-          ),
-        )
-
-        newResults.push(
-          runBacktest(
-            MARKET_DATA,
-            getStrategyByType('NO_REBALANCE'),
-            qldConfig,
-            'Benchmark: QLD',
-            '#94a3b8', // Slate-400
-          ),
-        )
-      }
-
-      setResults(newResults)
-      setIsCalculated(true)
-      setIsCalculating(false)
-
-      // Auto close on mobile only
-      if (window.innerWidth < 1024) {
-        setSidebarOpen(false)
       }
     }, 100) // Small delay to yield to UI thread
   }, [profiles, showBenchmarks])
@@ -520,6 +570,17 @@ const MainApp = () => {
               <Activity className="w-4 h-4" />
               {t('liveMonitor')}
             </button>
+            <button
+              onClick={() => setCurrentView('stocks')}
+              className={`flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-sm font-bold transition-all ${
+                currentView === 'stocks'
+                  ? 'bg-white text-blue-600 shadow-sm'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              <Database className="w-4 h-4" />
+              数据管理
+            </button>
           </div>
         </div>
 
@@ -542,8 +603,8 @@ const MainApp = () => {
 
             <div className="mt-8 px-2 text-xs text-slate-400 leading-relaxed hidden lg:block">
               <p>
-                {t('dataRange')}: {MARKET_DATA[0].date.substring(0, 4)} -{' '}
-                {MARKET_DATA[MARKET_DATA.length - 1].date.substring(0, 4)}
+                {t('dataRange')}: {currentMarketData.length > 0 ? currentMarketData[0].date.substring(0, 4) : '—'} -{' '}
+                {currentMarketData.length > 0 ? currentMarketData[currentMarketData.length - 1].date.substring(0, 4) : '—'}
               </p>
               <p className="mt-2">{t('appDesc')}</p>
             </div>
@@ -555,7 +616,7 @@ const MainApp = () => {
       <main className="flex-1 min-w-0 p-4 lg:p-8 relative">
         {/* Desktop Expand Button (Floating) */}
         <div
-          className={`fixed top-6 left-6 z-30 transition-opacity duration-300 ${!isSidebarOpen && window.innerWidth >= 1024 ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+          className={`fixed top-6 left-6 z-30 transition-opacity duration-300 hidden lg:block ${!isSidebarOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
         >
           <button
             onClick={() => setSidebarOpen(true)}
@@ -566,7 +627,15 @@ const MainApp = () => {
           </button>
         </div>
 
-        {currentView === 'monitor' ? (
+        {currentView === 'stocks' ? (
+          <div className="max-w-3xl mx-auto animate-in fade-in duration-500">
+            <div className="mb-6 hidden lg:block">
+              <h2 className="text-2xl font-bold text-slate-800">历史股价管理</h2>
+              <p className="text-slate-500">下载并缓存标的历史数据到本地，支持自定义标的回测。</p>
+            </div>
+            <PriceUpdatePanel />
+          </div>
+        ) : currentView === 'monitor' ? (
           <div className="max-w-7xl mx-auto animate-in fade-in duration-500">
             <MarketMonitor />
           </div>
@@ -578,7 +647,11 @@ const MainApp = () => {
                 {t('comparingPerformance')} {results.length} {t('profiles')}.
               </p>
             </div>
-            <ResultsDashboard results={results} />
+            <ResultsDashboard 
+              results={results} 
+              onUpdateMarketData={handleUpdateAllData}
+              isUpdatingData={isCalculating}
+            />
           </div>
         ) : (
           <div className="flex items-center justify-center h-full text-slate-400">

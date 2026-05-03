@@ -38,13 +38,27 @@ import {
   MousePointer2,
   Eye,
   EyeOff,
+  Settings2,
 } from 'lucide-react'
 import { useTranslation } from '../services/i18n'
 import { MathModelModal } from './MathModelModal'
 import { generateProfessionalReport } from '../services/reportService'
+import { detectCycleSegments } from '../services/marketCycleService'
+import { CYCLE_COLORS, CYCLE_LABELS } from '../constants'
+import { CycleSegment } from '../types'
+
+// v1.1 周期阈値参数类型
+export interface CycleThresholds {
+  drawdownThreshold: number  // 下行阶段最小跌幅阈値
+  recoveryThreshold: number  // 修复阶段最小反弹阈値
+  athBuffer: number          // 突破前高的容差
+  mergeGapMonths: number     // 小于该月数的短分段自动合并
+}
 
 interface ResultsDashboardProps {
   results: SimulationResult[]
+  onUpdateMarketData?: () => void
+  isUpdatingData?: boolean
 }
 
 const MetricCard: React.FC<{
@@ -177,12 +191,14 @@ const CustomTooltip = ({
   label,
   formatType = 'auto',
   operationDots,
+  cycleSegments,
 }: {
   active?: boolean
   payload?: { name: string; value: number; color: string }[]
   label?: string
   formatType?: 'currency' | 'percent' | 'number' | 'auto'
   operationDots?: Map<string, OperationDot[]>
+  cycleSegments?: CycleSegment[]
 }) => {
   if (active && payload && payload.length) {
     const filteredPayload = (payload as { name: string; value: number; color: string }[]).filter(
@@ -193,9 +209,31 @@ const CustomTooltip = ({
     // 获取当前 date 的操作点
     const dots: OperationDot[] = (label ? operationDots?.get(label) : undefined) ?? []
 
+    // 获取当前周期的分段信息 (PRD v1.1 §3.6)
+    const currentCycle = label ? cycleSegments?.find(s => label >= s.startDate && label <= s.endDate) : null
+
     return (
       <div className="bg-white p-3 border border-slate-200 shadow-xl rounded-xl text-xs" style={{ maxWidth: 340, zIndex: 9999 }}>
         <p className="font-bold text-slate-700 mb-2">{label}</p>
+        
+        {/* 周期信息显示 */}
+        {currentCycle && (
+          <div className="mb-2 p-2 rounded bg-slate-50 border border-slate-100">
+            <div className="flex items-center gap-1.5 mb-1">
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: CYCLE_COLORS[currentCycle.type] }} />
+              <span className="font-bold text-slate-700">📍 周期状态：{CYCLE_LABELS[currentCycle.type]}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10px] text-slate-500">
+              {currentCycle.drawdownPct !== undefined && currentCycle.drawdownPct < 0 && (
+                <div>距前高回撤: <span className="font-bold text-red-600">{currentCycle.drawdownPct.toFixed(1)}%</span></div>
+              )}
+              {currentCycle.recoveryPct !== undefined && currentCycle.recoveryPct > 0 && (
+                <div>距低点反弹: <span className="font-bold text-green-600">+{currentCycle.recoveryPct.toFixed(1)}%</span></div>
+              )}
+              <div className="col-span-2">本段起始: {currentCycle.startDate}</div>
+            </div>
+          </div>
+        )}
         {filteredPayload.map((p) => {
           let formattedValue = ''
           const val = Number(p.value)
@@ -277,6 +315,21 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
   const [isGeneratingReport, setIsGeneratingReport] = useState(false)
   // PRD C6：操作标注点总开关
   const [showDots, setShowDots] = useState(true)
+  // v1.1 周期色块开关
+  const [showCycles, setShowCycles] = useState(true)
+  // v1.1 周期阈値设置
+  const [cycleThresholds, setCycleThresholds] = useState<CycleThresholds>({
+    drawdownThreshold: 0.10,
+    recoveryThreshold: 0.10,
+    athBuffer: 0.01,
+    mergeGapMonths: 2,
+  })
+  const [showThresholdPanel, setShowThresholdPanel] = useState(false)
+  // v1.1 手动日期区间 (已应用)
+  const [appliedDateRange, setAppliedDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' })
+  // 暂存输入，点击“确认”后同步到 appliedDateRange
+  const [tempDateRange, setTempDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' })
+  const [showDatePanel, setShowDatePanel] = useState(false)
   const [sortConfig, setSortConfig] = useState<{
     key: keyof SimulationResult['metrics'] | 'strategyName'
     direction: 'asc' | 'desc'
@@ -349,48 +402,78 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
         : results
 
   // Calculate overall data max for Y-axis scaling
-  const dataMaxVal = results.reduce(
-    (max, res) => Math.max(max, ...res.history.map((h) => h.totalValue)),
-    0,
-  )
+  const dataMaxVal = results.reduce((max, res) => {
+    if (!res.history || res.history.length === 0) return max
+    const historyMax = res.history.reduce((hMax, h) => Math.max(hMax, h.totalValue), 0)
+    return Math.max(max, historyMax)
+  }, 0)
 
   // Calculate a clean range: buffer on both ends, then round to clean steps
   const getCleanAxisConfig = (minVal: number, maxVal: number, targetTicks = 6) => {
-    const range = Math.max(0.1, maxVal - minVal)
-    const rawMin = minVal - range * 0.05
-    const rawMax = maxVal + range * 0.05
+    try {
+      // 1. 基础健壮性检查
+      if (!isFinite(minVal) || isNaN(minVal)) minVal = 0;
+      if (!isFinite(maxVal) || isNaN(maxVal)) maxVal = 100;
+      if (maxVal <= minVal) maxVal = minVal + 100;
 
-    // If min is very close to 0 (less than 10% of max), just start from 0 for cleaner look
-    const finalMin = rawMin < maxVal * 0.1 && rawMin >= 0 ? 0 : rawMin
+      const range = Math.max(0.1, maxVal - minVal);
+      const rawMin = minVal - range * 0.05;
+      const rawMax = maxVal + range * 0.05;
 
-    const actualRange = rawMax - finalMin
-    const roughStep = actualRange / targetTicks
-    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)) || 0)
-    const normalizedStep = roughStep / magnitude
+      // If min is very close to 0 (less than 10% of max), just start from 0 for cleaner look
+      const finalMin = rawMin < maxVal * 0.1 && rawMin >= 0 ? 0 : rawMin;
 
-    let cleanStep = magnitude
-    if (normalizedStep > 5) cleanStep = 10 * magnitude
-    else if (normalizedStep > 2.5) cleanStep = 5 * magnitude
-    else if (normalizedStep > 1.5) cleanStep = 2 * magnitude
+      const actualRange = Math.max(0.0001, rawMax - finalMin);
+      const roughStep = actualRange / Math.max(1, targetTicks);
+      
+      const magRaw = Math.log10(roughStep);
+      const magnitude = isFinite(magRaw) ? Math.pow(10, Math.floor(magRaw)) : 1;
+      const normalizedStep = (magnitude !== 0 && isFinite(magnitude)) ? roughStep / magnitude : 1;
 
-    // CRITICAL: Ensure cleanStep is large enough relative to maxBound to avoid floating point stuck loops
-    // Double precision has ~15-17 significant digits.
-    const minSafeStep = Math.max(1e-12, Math.abs(rawMax) * 1e-14)
-    if (cleanStep < minSafeStep) cleanStep = minSafeStep
+      let cleanStep = magnitude;
+      if (isNaN(normalizedStep) || !isFinite(normalizedStep)) {
+        cleanStep = Math.max(1, magnitude);
+      } else if (normalizedStep > 5) {
+        cleanStep = 10 * magnitude;
+      } else if (normalizedStep > 2.5) {
+        cleanStep = 5 * magnitude;
+      } else if (normalizedStep > 1.5) {
+        cleanStep = 2 * magnitude;
+      }
+      
+      // Ensure cleanStep is valid
+      if (!isFinite(cleanStep) || cleanStep <= 0) cleanStep = 1;
 
-    const cleanMin = Math.floor(finalMin / cleanStep) * cleanStep
-    const cleanMax = Math.ceil(rawMax / cleanStep) * cleanStep
+      // CRITICAL: Ensure cleanStep is large enough relative to maxBound to avoid floating point stuck loops
+      const minSafeStep = Math.max(1e-12, Math.abs(rawMax) * 1e-14);
+      if (cleanStep < minSafeStep || isNaN(cleanStep)) cleanStep = minSafeStep;
 
-    const ticks: number[] = []
-    let curr = cleanMin
-    let safetyCounter = 0
-    // Limit to 50 ticks to satisfy E2E test constraints and prevent UI clutter/crashes
-    while (curr <= cleanMax + cleanStep / 10 && safetyCounter < 50) {
-      ticks.push(Number(curr.toFixed(curr < 1 ? 4 : 2))) // Use appropriate precision
-      curr += cleanStep
-      safetyCounter++
+      const cleanMin = Math.floor(finalMin / cleanStep) * cleanStep;
+      const cleanMax = Math.ceil(rawMax / cleanStep) * cleanStep;
+
+      const ticks: number[] = [];
+      let curr = cleanMin;
+      let safetyCounter = 0;
+      
+      // Limit to 50 ticks to satisfy E2E test constraints and prevent UI clutter/crashes
+      while (isFinite(curr) && curr <= cleanMax + cleanStep / 10 && safetyCounter < 50) {
+        // toFixed 容错
+        const precision = curr < 0.1 ? 6 : curr < 1 ? 4 : 2;
+        ticks.push(Number(curr.toFixed(precision)));
+        curr += cleanStep;
+        safetyCounter++;
+      }
+      
+      const finalMinBound = (!isFinite(cleanMin) || isNaN(cleanMin)) ? 0 : cleanMin;
+      const finalMaxBound = (!isFinite(cleanMax) || isNaN(cleanMax)) ? (finalMinBound + 100) : cleanMax;
+      const finalTicks = ticks.filter(t => isFinite(t) && !isNaN(t));
+      const safeTicks = finalTicks.length > 0 ? finalTicks : [finalMinBound, finalMaxBound];
+
+      return { step: cleanStep, minBound: finalMinBound, maxBound: finalMaxBound, ticks: safeTicks };
+    } catch (err) {
+      console.error("getCleanAxisConfig failed:", err);
+      return { step: 100, minBound: 0, maxBound: 1000, ticks: [0, 500, 1000] };
     }
-    return { step: cleanStep, minBound: cleanMin, maxBound: cleanMax, ticks }
   }
 
   const growthConfig = getCleanAxisConfig(0, dataMaxVal)
@@ -399,15 +482,32 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
     ;(window as unknown as { __CHART_GLOBAL_MAX: number }).__CHART_GLOBAL_MAX = dataMaxVal
   }
 
-  // Prepare Chart Data (Growth)
+  // v1.1 鲁棒的数据聚合：基于日期对齐而非索引 (修复不同标的数据长度/日期不一导致的崩溃)
   const chartData = React.useMemo(() => {
-    if (!results || results.length === 0 || !results[0]) return []
-    return results[0].history.map((_, idx) => {
-      const row: Record<string, string | number> = { date: results[0].history[idx].date }
-      results.forEach((res) => {
-        // If history stops early (due to bankruptcy optimization), use 0 or last val
-        const val = res.history[idx]?.totalValue ?? 0
-        row[res.strategyName] = val
+    if (!results || results.length === 0) return []
+    
+    // 1. 获取所有结果中出现过的所有唯一日期，并排序
+    const dateSet = new Set<string>()
+    results.forEach(res => {
+      res.history?.forEach(h => dateSet.add(h.date))
+    })
+    const sortedDates = Array.from(dateSet).sort()
+
+    // 2. 为每个策略构建日期索引 Map 以提高查找速度
+    const strategyMaps = results.map((res: any) => {
+      const map = new Map<string, any>()
+      res.history?.forEach((h: any) => map.set(h.date, h))
+      return { name: res.strategyName, map }
+    })
+
+    // 3. 构建聚合数据行
+    return sortedDates.map(date => {
+      const row: Record<string, string | number> = { date }
+      strategyMaps.forEach(({ name, map }: any) => {
+        const state = map.get(date)
+        if (state) {
+          row[name] = state.totalValue
+        }
       })
       // Add dummy point to anchor Y-axis (hidden in Line)
       row['_yAnchor'] = growthConfig.maxBound
@@ -415,16 +515,27 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
     })
   }, [results, growthConfig])
 
-  // Visible Data based on Zoom
+  // v1.1 手动日期区间过滤
+  const dateFilteredChartData = React.useMemo(() => {
+    if (!appliedDateRange.start && !appliedDateRange.end) return chartData
+    return chartData.filter((d) => {
+      const date = d.date as string
+      if (appliedDateRange.start && date < appliedDateRange.start) return false
+      if (appliedDateRange.end && date > appliedDateRange.end) return false
+      return true
+    })
+  }, [chartData, appliedDateRange])
+
+  // Visible Data based on Zoom (combines zoom + date filter)
   const visibleChartData = React.useMemo(() => {
     const data =
       !zoomState.left || !zoomState.right
-        ? chartData
-        : chartData.filter(
+        ? dateFilteredChartData
+        : dateFilteredChartData.filter(
             (d) => (d.date as string) >= zoomState.left! && (d.date as string) <= zoomState.right!,
           )
     return data
-  }, [chartData, zoomState])
+  }, [dateFilteredChartData, zoomState])
 
   // Local Y-Axis Config for Zoomed Data
   const currentGrowthConfig = React.useMemo(() => {
@@ -439,54 +550,87 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
         if (val < min) min = val
       })
     })
+
+    if (max === -Infinity || min === Infinity) return growthConfig
     return getCleanAxisConfig(min, max)
   }, [visibleChartData, results, growthConfig, zoomState])
 
   // Prepare Drawdown Data
   const drawdownData = React.useMemo(() => {
-    if (!results || results.length === 0 || !results[0]) return []
-    const data = results[0].history.map((h) => ({ date: h.date }))
-    results.forEach((res) => {
-      let peak = -Infinity
-      res.history.forEach((h, idx) => {
-        if (h.totalValue > peak) peak = h.totalValue
-        const dd = peak === 0 ? 0 : ((h.totalValue - peak) / peak) * 100
-        // Clamp to -100% as you cannot lose more than 100% of peak
-        ;(data[idx] as Record<string, string | number>)[res.strategyName] = Math.max(-100, dd)
-      })
+    const dateSet = new Set<string>()
+    results.forEach((res: any) => res.history?.forEach((h: any) => dateSet.add(h.date)))
+    const sortedDates = Array.from(dateSet).sort()
+
+    const strategyMaps = results.map((res: any) => {
+      const map = new Map<string, any>()
+      res.history?.forEach((h: any) => map.set(h.date, h))
+      return { name: res.strategyName, map }
     })
-    return data
+
+    return sortedDates.map(date => {
+      const row: Record<string, string | number> = { date }
+      strategyMaps.forEach(({ name, map }: any) => {
+        const state = map.get(date)
+        if (state) row[name] = state.drawdownFromAth ?? 0
+      })
+      return row
+    })
   }, [results])
 
-  // Prepare LTV Data (Only for leveraged profiles)
+  // Prepare LTV Data
   const leveragedProfiles = results.filter((r) => r.isLeveraged)
   const ltvData = React.useMemo(() => {
-    if (!results || results.length === 0 || !results[0] || leveragedProfiles.length === 0) return []
-    const data = results[0].history.map((h) => ({ date: h.date }))
-    leveragedProfiles.forEach((res) => {
-      res.history.forEach((h, idx) => {
-        ;(data[idx] as Record<string, string | number>)[res.strategyName] = h.ltv
-      })
+    if (!results || results.length === 0 || leveragedProfiles.length === 0) return []
+    
+    const dateSet = new Set<string>()
+    leveragedProfiles.forEach((res: any) => res.history?.forEach((h: any) => dateSet.add(h.date)))
+    const sortedDates = Array.from(dateSet).sort()
+
+    const strategyMaps = leveragedProfiles.map((res: any) => {
+      const map = new Map<string, any>()
+      res.history?.forEach((h: any) => map.set(h.date, h))
+      return { name: res.strategyName, map }
     })
-    return data
+
+    return sortedDates.map(date => {
+      const row: Record<string, string | number> = { date }
+      strategyMaps.forEach(({ name, map }: any) => {
+        const state = map.get(date)
+        if (state) row[name] = state.ltv ?? 0
+      })
+      return row
+    })
   }, [results, leveragedProfiles])
 
   // Prepare Beta Data
   const betaData = React.useMemo(() => {
-    if (!results || results.length === 0 || !results[0]) return []
-    const data = results[0].history.map((h) => ({ date: h.date }))
-    results.forEach((res) => {
-      res.history.forEach((h, idx) => {
-        ;(data[idx] as Record<string, string | number>)[res.strategyName] = h.beta
-      })
+    if (!results || results.length === 0) return []
+    
+    const dateSet = new Set<string>()
+    results.forEach((res: any) => res.history?.forEach((h: any) => dateSet.add(h.date)))
+    const sortedDates = Array.from(dateSet).sort()
+
+    const strategyMaps = results.map((res: any) => {
+      const map = new Map<string, any>()
+      res.history?.forEach((h: any) => map.set(h.date, h))
+      return { name: res.strategyName, map }
     })
-    return data
+
+    return sortedDates.map(date => {
+      const row: Record<string, string | number> = { date }
+      strategyMaps.forEach(({ name, map }: any) => {
+        const state = map.get(date)
+        if (state) row[name] = state.beta ?? 0
+      })
+      return row
+    })
   }, [results])
 
   // Prepare Cash Data for ALL profiles that have cash usage
   const cashCharts = results
     .map((res) => {
-      const data = res.history.map((h) => ({
+      const history = res.history || []
+      const data = history.map((h) => ({
         date: h.date,
         cashPct: h.totalValue > 0 ? (h.cashBalance / h.totalValue) * 100 : 0,
         equityPct: h.totalValue > 0 ? 100 - (h.cashBalance / h.totalValue) * 100 : 0,
@@ -546,6 +690,7 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
   const operationDots = useMemo(() => {
     const dotsMap = new Map<string, OperationDot[]>()
     chartResults.forEach((res) => {
+      if (!res.history) return
       res.history.forEach((state) => {
         const dateKey = state.date
         if (!state.events || state.events.length === 0) return
@@ -594,6 +739,15 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
     })
     return result
   }, [operationDots])
+
+  // 市场周期识别 (PRD v1.1 §3.3) - 支持自定义阈値
+  const cycleSegments = useMemo(() => {
+    if (chartResults.length === 0) return []
+    // 安全检查 history
+    const history = chartResults[0]?.history
+    if (!history || history.length === 0) return []
+    return detectCycleSegments(history, cycleThresholds)
+  }, [chartResults, cycleThresholds])
 
   const handleDownloadReport = async () => {
     setIsGeneratingReport(true)
@@ -668,6 +822,20 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
             )}
           </div>
           <div className="flex items-center gap-2">
+            {/* v1.1：周期色块开关 */}
+            <button
+              onClick={() => setShowCycles(!showCycles)}
+              className={clsx(
+                'flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all rounded-lg border shadow-sm active:scale-95',
+                showCycles
+                  ? 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'
+                  : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50',
+              )}
+              title="显示/隐藏市场周期色块"
+            >
+              {showCycles ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+              <span className="hidden sm:inline">周期色块</span>
+            </button>
             {/* PRD C6：标注点总开关 */}
             <button
               onClick={() => setShowDots(!showDots)}
@@ -708,11 +876,175 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                 {t('resetZoom') || 'Reset Zoom'}
               </button>
             )}
+            {/* v1.1: 日期区间按钮 */}
+            <button
+              onClick={() => { 
+                const isOpen = !showDatePanel;
+                setShowDatePanel(isOpen); 
+                setShowThresholdPanel(false);
+                // 打开时如果尚未设置，则默认填入：结束日期为系统今天，开始日期为结束日期的年初
+                if (isOpen && !tempDateRange.start && !tempDateRange.end) {
+                  const now = new Date();
+                  const year = now.getFullYear();
+                  const month = String(now.getMonth() + 1).padStart(2, '0');
+                  const day = String(now.getDate()).padStart(2, '0');
+                  const today = `${year}-${month}-${day}`;
+                  const startOfYear = `${year}-01-01`;
+                  setTempDateRange({ start: startOfYear, end: today });
+                }
+              }}
+              className={clsx(
+                'flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all rounded-lg border shadow-sm active:scale-95',
+                (appliedDateRange.start || appliedDateRange.end)
+                  ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100'
+                  : showDatePanel
+                    ? 'bg-slate-100 text-slate-700 border-slate-300'
+                    : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50',
+              )}
+              title="设置日期区间过滤"
+            >
+              <Activity className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">日期区间</span>
+              {(appliedDateRange.start || appliedDateRange.end) && <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />}
+            </button>
+            {/* v1.1: 阈值设置按钮 */}
+            <button
+              onClick={() => { setShowThresholdPanel(!showThresholdPanel); setShowDatePanel(false) }}
+              className={clsx(
+                'flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all rounded-lg border shadow-sm active:scale-95',
+                showThresholdPanel
+                  ? 'bg-slate-100 text-slate-700 border-slate-300'
+                  : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50',
+              )}
+              title="调整周期识别阈值"
+            >
+              <Settings2 className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">周期阈值</span>
+            </button>
             <p className="text-[10px] text-slate-400 font-medium hidden sm:block italic">
               {t('dragToZoom') || 'Drag to Zoom region'}
             </p>
           </div>
         </div>
+
+        {/* v1.1: 日期区间面板 */}
+        {showDatePanel && (
+          <div className="mb-4 p-3 bg-blue-50 rounded-xl border border-blue-100 flex flex-wrap gap-4 items-center">
+            <span className="text-xs font-bold text-blue-700">📅 日期区间过滤</span>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-slate-500">开始</label>
+              <input
+                type="date"
+                value={tempDateRange.start}
+                onChange={(e) => setTempDateRange(prev => ({ ...prev, start: e.target.value }))}
+                className="text-xs border border-slate-200 rounded-md px-2 py-1 bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-slate-500">结束</label>
+              <input
+                type="date"
+                value={tempDateRange.end}
+                onChange={(e) => setTempDateRange(prev => ({ ...prev, end: e.target.value }))}
+                className="text-xs border border-slate-200 rounded-md px-2 py-1 bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-400"
+              />
+            </div>
+            <div className="flex items-center gap-2 ml-auto sm:ml-0">
+              <button
+                onClick={() => setAppliedDateRange({ ...tempDateRange })}
+                className="px-3 py-1 bg-blue-600 text-white text-xs font-bold rounded-md hover:bg-blue-700 transition-colors shadow-sm"
+              >
+                确认应用
+              </button>
+              <button
+                onClick={() => {
+                  setAppliedDateRange({ start: '', end: '' });
+                  setTempDateRange({ start: '', end: '' });
+                }}
+                className="text-xs text-slate-500 hover:text-slate-700 underline px-2"
+              >
+                重置
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* v1.1: 周期阈值面板 */}
+        {showThresholdPanel && (
+          <div className="mb-4 p-4 bg-slate-50 rounded-xl border border-slate-200">
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-xs font-bold text-slate-700">⚙️ 市场周期识别阈值</span>
+              <button
+                onClick={() => setCycleThresholds({ drawdownThreshold: 0.10, recoveryThreshold: 0.10, athBuffer: 0.01, mergeGapMonths: 2 })}
+                className="text-xs text-slate-400 hover:text-slate-600 underline"
+              >
+                重置默认值
+              </button>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">下行触发跌幅 (%)</label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="range" min="3" max="30" step="1"
+                    value={Math.round(cycleThresholds.drawdownThreshold * 100)}
+                    onChange={(e) => setCycleThresholds(prev => ({ ...prev, drawdownThreshold: Number(e.target.value) / 100 }))}
+                    className="flex-1 h-1 accent-red-500"
+                  />
+                  <span className="text-xs font-mono text-red-600 w-8 text-right">
+                    -{Math.round(cycleThresholds.drawdownThreshold * 100)}%
+                  </span>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">修复触发反弹 (%)</label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="range" min="3" max="30" step="1"
+                    value={Math.round(cycleThresholds.recoveryThreshold * 100)}
+                    onChange={(e) => setCycleThresholds(prev => ({ ...prev, recoveryThreshold: Number(e.target.value) / 100 }))}
+                    className="flex-1 h-1 accent-green-500"
+                  />
+                  <span className="text-xs font-mono text-green-600 w-8 text-right">
+                    +{Math.round(cycleThresholds.recoveryThreshold * 100)}%
+                  </span>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">新高容差 (%)</label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="range" min="0" max="5" step="0.5"
+                    value={(cycleThresholds.athBuffer * 100).toFixed(1)}
+                    onChange={(e) => setCycleThresholds(prev => ({ ...prev, athBuffer: Number(e.target.value) / 100 }))}
+                    className="flex-1 h-1 accent-blue-500"
+                  />
+                  <span className="text-xs font-mono text-blue-600 w-8 text-right">
+                    {(cycleThresholds.athBuffer * 100).toFixed(1)}%
+                  </span>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">短段合并月数</label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="range" min="0" max="12" step="1"
+                    value={cycleThresholds.mergeGapMonths}
+                    onChange={(e) => setCycleThresholds(prev => ({ ...prev, mergeGapMonths: Number(e.target.value) }))}
+                    className="flex-1 h-1 accent-amber-500"
+                  />
+                  <span className="text-xs font-mono text-amber-600 w-8 text-right">
+                    {cycleThresholds.mergeGapMonths}mo
+                  </span>
+                </div>
+              </div>
+            </div>
+            <p className="text-[10px] text-slate-400 mt-2">
+              💡 增大"下行触发跌幅"或"短段合并月数"可将多个小周期合并为一个大周期
+            </p>
+          </div>
+        )}
+
         <div style={{ height: `${calculateChartHeight(400)}px` }}>
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
@@ -748,7 +1080,7 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                 interval={0}
                 allowDataOverflow={true}
               />
-              <Tooltip content={<CustomTooltip formatType="currency" operationDots={operationDots} />} />
+              <Tooltip content={<CustomTooltip formatType="currency" operationDots={operationDots} cycleSegments={cycleSegments} />} />
               <Legend />
               {/* 隐藏锤点用于强制 Y 轴 domain */}
               <Line
@@ -759,6 +1091,17 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                 legendType="none"
                 connectNulls
               />
+              {/* 市场周期色块渲染 (PRD v1.1 §3.4) */}
+              {showCycles && cycleSegments.map((seg, i) => (
+                <ReferenceArea
+                  key={`cycle-${i}`}
+                  x1={seg.startDate}
+                  x2={seg.endDate}
+                  fill={CYCLE_COLORS[seg.type]}
+                  fillOpacity={0.2}
+                  ifOverflow="visible"
+                />
+              ))}
               {refAreaLeft && refAreaRight && (
                 <ReferenceArea
                   x1={refAreaLeft}
@@ -798,6 +1141,18 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
               })}
             </LineChart>
           </ResponsiveContainer>
+
+          {/* v1.1 周期图例 (PRD §3.5) */}
+          {showCycles && (
+            <div className="mt-4 flex flex-wrap justify-center gap-x-6 gap-y-2 py-3 px-4 bg-slate-50 rounded-xl border border-slate-100">
+              {Object.entries(CYCLE_LABELS).map(([type, label]) => (
+                <div key={type} className="flex items-center gap-2 text-[11px] font-bold text-slate-600">
+                  <span className="w-3 h-3 rounded shadow-sm" style={{ backgroundColor: CYCLE_COLORS[type] }} />
+                  {label}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         {isLargeSet && (
           <p className="text-[10px] text-slate-400 mt-2 text-center">
@@ -816,6 +1171,7 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
               data={(() => {
                 const yearMap: { [year: string]: Record<string, number | string> } = {}
                 chartResults.forEach((res) => {
+                  if (!res.history) return
                   const annuals = res.history.reduce(
                     (acc: Record<string, { start: number; end: number }>, h, idx) => {
                       const year = h.date.substring(0, 4)
@@ -951,10 +1307,11 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                   (dataMax: number) => getCleanAxisConfig(0, Math.max(1, dataMax), 5).maxBound,
                 ]}
                 ticks={(() => {
-                  const dataMax = results.reduce(
-                    (max, res) => Math.max(max, ...res.history.map((h) => h.beta)),
-                    0,
-                  )
+                  const dataMax = results.reduce((max, res) => {
+                    if (!res.history) return max
+                    const hMax = res.history.reduce((m, h) => Math.max(m, h.beta), 0)
+                    return Math.max(max, hMax)
+                  }, 0)
                   return getCleanAxisConfig(0, Math.max(1, dataMax), 5).ticks
                 })()}
                 interval={0}
@@ -1012,10 +1369,11 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                       Math.min(100, getCleanAxisConfig(0, Math.max(10, dataMax), 5).maxBound),
                   ]}
                   ticks={(() => {
-                    const dataMax = results.reduce(
-                      (max, res) => Math.max(max, ...res.history.map((h) => h.ltv)),
-                      0,
-                    )
+                    const dataMax = results.reduce((max, res) => {
+                      if (!res.history) return max
+                      const hMax = res.history.reduce((m, h) => Math.max(m, h.ltv), 0)
+                      return Math.max(max, hMax)
+                    }, 0)
                     const config = getCleanAxisConfig(0, Math.max(10, dataMax), 5)
                     return config.ticks.filter((t) => t <= 100)
                   })()}
@@ -1281,26 +1639,26 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <MetricCard
               title={t('bestBalance')}
-              value={`$${Math.round(bestBalance.metrics.finalBalance).toLocaleString()}`}
+              value={bestBalance ? `$${Math.round(bestBalance.metrics.finalBalance).toLocaleString()}` : '--'}
               icon={<TrendingUp className="w-5 h-5" />}
-              winnerName={bestBalance.strategyName}
-              winnerColor={bestBalance.color}
+              winnerName={bestBalance?.strategyName || '--'}
+              winnerColor={bestBalance?.color || '#ccc'}
               highlight
             />
             <MetricCard
               title={t('bestCagr')}
-              value={`${bestCAGR.metrics.cagr.toFixed(2)}%`}
+              value={bestCAGR ? `${bestCAGR.metrics.cagr.toFixed(2)}%` : '--'}
               icon={<Zap className="w-5 h-5" />}
-              winnerName={bestCAGR.strategyName}
-              winnerColor={bestCAGR.color}
+              winnerName={bestCAGR?.strategyName || '--'}
+              winnerColor={bestCAGR?.color || '#ccc'}
               highlight
             />
             <MetricCard
               title={t('bestIrr')}
-              value={`${bestIRR.metrics.irr.toFixed(2)}%`}
+              value={bestIRR ? `${bestIRR.metrics.irr.toFixed(2)}%` : '--'}
               icon={<Zap className="w-5 h-5" />}
-              winnerName={bestIRR.strategyName}
-              winnerColor={bestIRR.color}
+              winnerName={bestIRR?.strategyName || '--'}
+              winnerColor={bestIRR?.color || '#ccc'}
               highlight
             />
           </div>
@@ -1315,24 +1673,24 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <MetricCard
               title={t('lowestDrawdown')}
-              value={`${bestDrawdown.metrics.maxDrawdown.toFixed(2)}%`}
+              value={bestDrawdown ? `${bestDrawdown.metrics.maxDrawdown.toFixed(2)}%` : '--'}
               icon={<ShieldAlert className="w-5 h-5" />}
-              winnerName={bestDrawdown.strategyName}
-              winnerColor={bestDrawdown.color}
+              winnerName={bestDrawdown?.strategyName || '--'}
+              winnerColor={bestDrawdown?.color || '#ccc'}
             />
             <MetricCard
               title={t('maxRecoveryTime')}
-              value={`${bestRecoveryMonths.metrics.maxRecoveryMonths} ${t('recoveryMonths')}`}
+              value={bestRecoveryMonths ? `${bestRecoveryMonths.metrics.maxRecoveryMonths} ${t('recoveryMonths')}` : '--'}
               icon={<Clock className="w-5 h-5" />}
-              winnerName={bestRecoveryMonths.strategyName}
-              winnerColor={bestRecoveryMonths.color}
+              winnerName={bestRecoveryMonths?.strategyName || '--'}
+              winnerColor={bestRecoveryMonths?.color || '#ccc'}
             />
             <MetricCard
               title={t('painIndex')}
-              value={`${bestPainIndex.metrics.painIndex.toFixed(2)}`}
+              value={bestPainIndex ? `${bestPainIndex.metrics.painIndex.toFixed(2)}` : '--'}
               icon={<Percent className="w-5 h-5" />}
-              winnerName={bestPainIndex.strategyName}
-              winnerColor={bestPainIndex.color}
+              winnerName={bestPainIndex?.strategyName || '--'}
+              winnerColor={bestPainIndex?.color || '#ccc'}
             />
           </div>
         </div>
@@ -1346,17 +1704,17 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <MetricCard
               title={t('bestSharpe')}
-              value={bestSharpe.metrics.sharpeRatio.toFixed(2)}
+              value={bestSharpe ? bestSharpe.metrics.sharpeRatio.toFixed(2) : '--'}
               icon={<Activity className="w-5 h-5" />}
-              winnerName={bestSharpe.strategyName}
-              winnerColor={bestSharpe.color}
+              winnerName={bestSharpe?.strategyName || '--'}
+              winnerColor={bestSharpe?.color || '#ccc'}
             />
             <MetricCard
               title={t('calmarRatio')}
-              value={`${bestCalmar.metrics.calmarRatio.toFixed(2)}`}
+              value={bestCalmar ? `${bestCalmar.metrics.calmarRatio.toFixed(2)}` : '--'}
               icon={<Scale className="w-5 h-5" />}
-              winnerName={bestCalmar.strategyName}
-              winnerColor={bestCalmar.color}
+              winnerName={bestCalmar?.strategyName || '--'}
+              winnerColor={bestCalmar?.color || '#ccc'}
             />
           </div>
         </div>
