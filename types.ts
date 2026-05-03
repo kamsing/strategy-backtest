@@ -129,6 +129,10 @@ export interface FinancialEvent {
     | 'ALERT_SENT' // 信号推送已发送
   amount?: number
   description: string
+  // PRD §4：操作记录表所需的扩展字段（可选，向下兼容）
+  ticker?: string         // 操作涉及的标的代码（如 'QQQ', 'TQQQ'）
+  phasePct?: number       // 触发的阈值百分比（如 -10, -20, +10...）
+  sharesChanged?: number  // 本次操作的股数变化（正=买入，负=卖出）
 }
 
 export interface PortfolioState {
@@ -148,6 +152,10 @@ export interface PortfolioState {
 
   // Detailed logs for accounting reports
   events: FinancialEvent[]
+
+  // PRD §4：操作记录分组标签（可选，向下兼容）
+  // 值：'正常运行' | '下跌加码' | '上涨减码' | '回到高点'
+  groupLabel?: string
 }
 
 export interface SimulationResult {

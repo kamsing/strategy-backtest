@@ -679,6 +679,9 @@ export const strategyBearRotation: StrategyFunction = (state, marketData, config
           newState.events.push({
             type: 'ROTATION_IN',
             amount: sellValue,
+            ticker: tripleETF,                 // PRD §5.2：转入标的
+            sharesChanged: buyQty,             // PRD §5.2：转入数量（正值）
+            phasePct: -(bearPhase * 10),       // PRD §5.2：触发阈值（如 -10, -20）
             description: `[Phase ${bearPhase}] Shifted ${sellQty.toFixed(2)} QQQ to ${buyQty.toFixed(2)} ${tripleETF}`,
           })
         }
@@ -703,6 +706,9 @@ export const strategyBearRotation: StrategyFunction = (state, marketData, config
           newState.events.push({
             type: 'ROTATION_OUT',
             amount: sellValue,
+            ticker: 'QQQ',                      // PRD §5.2：转回 QQQ
+            sharesChanged: buyQty,              // PRD §5.2：买入 QQQ 数量（正值）
+            phasePct: recoveryPhase * 10,       // PRD §5.2：反弹阈值（如 +10, +20）
             description: `[Recovery ${recoveryPhase}] Restored ${sellQty.toFixed(2)} ${tripleETF} back to ${buyQty.toFixed(2)} QQQ`,
           })
         }
@@ -783,6 +789,9 @@ export const strategyBearPledge: StrategyFunction = (state, marketData, config, 
         newState.events.push({
           type: 'PLEDGE_BORROW',
           amount: actualBorrow,
+          ticker: buyTarget,                  // PRD §5.2：质押买入的标的
+          sharesChanged: buyQty,              // PRD §5.2：买入数量（正值）
+          phasePct: -(bearPhase * 10),        // PRD §5.2：触发阈值
           description: `[Phase ${bearPhase}] Pledged margin loan to buy ${buyQty.toFixed(2)} ${buyTarget}`,
         })
       }
@@ -829,6 +838,9 @@ export const strategyBearPledge: StrategyFunction = (state, marketData, config, 
         newState.events.push({
           type: 'PLEDGE_REPAY',
           amount: repay,
+          ticker: buyTarget,                  // PRD §5.2：卖出还款的标的
+          sharesChanged: -totalRepay / (getTickerClose(marketData, buyTarget) || 1), // 卖出股数为负值
+          phasePct: recoveryPhase * 10,       // PRD §5.2：反弹阈值
           description: `[Recovery ${recoveryPhase}] Sold positions to repay $${repay.toFixed(0)} margin loan`,
         })
       }

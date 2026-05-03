@@ -247,6 +247,11 @@ export const runBacktest = (
     currentState = strategyFunc(currentState, dataRow, config, index)
 
     // 检测交易（通过持仓变化推断）
+    // 策略自身已推送的 TRADE/ROTATION/PLEDGE 事件不重复统计
+    const hasExplicitTrade = currentState.events?.some(
+      (e) => e.type === 'ROTATION_IN' || e.type === 'ROTATION_OUT' || e.type === 'PLEDGE_BORROW' || e.type === 'PLEDGE_REPAY'
+    ) ?? false
+
     for (const ticker of new Set([
       ...Object.keys(sharesBeforeStrat),
       ...Object.keys(currentState.shares),
@@ -258,11 +263,22 @@ export const runBacktest = (
         const price = getTickerClose(dataRow, ticker)
         if (price > 0) {
           const cost = diff * price
-          monthEvents.push({
-            type: 'TRADE',
-            amount: -cost,
-            description: `${diff > 0 ? 'Buy' : 'Sell'} ${Math.abs(diff).toFixed(2)} ${ticker} @ ${price.toFixed(2)}`,
-          })
+          // 如果策略已推送该标的的 ROTATION/PLEDGE 事件，跳过重复 TRADE 事件
+          const alreadyCovered = hasExplicitTrade && currentState.events?.some(
+            (e) =>
+              (e.type === 'ROTATION_IN' || e.type === 'ROTATION_OUT' ||
+               e.type === 'PLEDGE_BORROW' || e.type === 'PLEDGE_REPAY') &&
+              (e.ticker === ticker || !e.ticker)
+          )
+          if (!alreadyCovered) {
+            monthEvents.push({
+              type: 'TRADE',
+              amount: -cost,
+              ticker,                    // PRD §5.1：补充标的代码
+              sharesChanged: diff,       // PRD §5.1：补充股数变化
+              description: `${diff > 0 ? 'Buy' : 'Sell'} ${Math.abs(diff).toFixed(2)} ${ticker} @ ${price.toFixed(2)}`,
+            })
+          }
         }
       }
     }
@@ -401,12 +417,28 @@ export const runBacktest = (
       currentState.beta = calcBeta(currentState.shares, dataRow, currentState.totalValue)
     }
 
-    // 5. 记录历史
+    // 5. 推导分组标签（PRD §5.3）
+    const bp = (currentState.strategyMemory.bearPhase as number) ?? 0
+    const rp = (currentState.strategyMemory.recoveryPhase as number) ?? 0
+    const hwmVal = (currentState.strategyMemory.hwm as number) ?? Infinity
+    let groupLabel: string
+    if (bp > 0) {
+      groupLabel = '下跌加码'
+    } else if (rp > 0) {
+      groupLabel = '上涨减码'
+    } else if (currentState.totalValue < hwmVal && hwmVal !== Infinity) {
+      groupLabel = '回到高点'
+    } else {
+      groupLabel = '正常运行'
+    }
+
+    // 6. 记录历史
     history.push({
       ...currentState,
       shares: { ...currentState.shares },
       strategyMemory: { ...currentState.strategyMemory },
       events: [...monthEvents, ...(currentState.events || [])],
+      groupLabel,
     })
   }
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
 import { clsx } from 'clsx'
 import { SimulationResult } from '../types'
 import {
@@ -15,6 +15,7 @@ import {
   BarChart,
   Bar,
   ReferenceArea,
+  ReferenceDot,
 } from 'recharts'
 import {
   TrendingUp,
@@ -35,6 +36,8 @@ import {
   RefreshCw,
   BoxSelect,
   MousePointer2,
+  Eye,
+  EyeOff,
 } from 'lucide-react'
 import { useTranslation } from '../services/i18n'
 import { MathModelModal } from './MathModelModal'
@@ -84,16 +87,102 @@ const MetricCard: React.FC<{
   </div>
 )
 
+// 操作点颜色映射（PRD §3.2）
+const DOT_COLOR: Record<string, string> = {
+  ROTATION_IN: '#f59e0b',
+  ROTATION_OUT: '#10b981',
+  PLEDGE_BORROW: '#f97316',
+  PLEDGE_REPAY: '#3b82f6',
+  WITHDRAW: '#8b5cf6',
+  INFO: '#dc2626',
+  DEPOSIT: '#6366f1',
+}
+
+// 操作点半径（PRD §3.2）
+const DOT_RADIUS: Record<string, number> = {
+  INFO: 7,
+  ROTATION_IN: 5,
+  ROTATION_OUT: 5,
+  PLEDGE_BORROW: 5,
+  PLEDGE_REPAY: 5,
+  WITHDRAW: 4,
+  DEPOSIT: 3,
+  TRADE: 3,
+}
+
+// 优先级（PRD §3.2，数字越小优先级越高）
+const DOT_PRIORITY: Record<string, number> = {
+  INFO: 0,
+  ROTATION_IN: 1,
+  ROTATION_OUT: 1,
+  PLEDGE_BORROW: 2,
+  PLEDGE_REPAY: 2,
+  TRADE: 3,
+  DEPOSIT: 4,
+  WITHDRAW: 5,
+}
+
+// 操作点数据结构
+interface OperationDot {
+  date: string
+  type: string
+  color: string
+  r: number
+  strategyName: string
+  strategyColor: string
+  totalValue: number
+  description: string
+  amount?: number
+  phasePct?: number
+}
+
+const OperationTooltipSection: React.FC<{
+  dots: OperationDot[]
+}> = ({ dots }) => {
+  if (dots.length === 0) return null
+  return (
+    <div className="mt-2 pt-2 border-t border-slate-200">
+      <p className="text-[10px] font-bold text-slate-500 mb-1.5">本月操作 ({dots.length} 条)</p>
+      {dots.map((dot, i) => (
+        <div key={i} className="flex items-start gap-1.5 mb-1 text-[10px]">
+          <span
+            className="flex-shrink-0 w-2 h-2 rounded-full mt-0.5"
+            style={{ backgroundColor: dot.color }}
+          />
+          <div>
+            <span className="font-bold" style={{ color: dot.strategyName ? dot.strategyColor : undefined }}>
+              {dot.strategyName}
+            </span>{' '}
+            <span className="text-slate-700">{dot.description}</span>
+            {dot.amount !== undefined && Math.abs(dot.amount) > 0.01 && (
+              <span className={`ml-1 font-mono font-bold ${dot.amount >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                {dot.amount >= 0 ? '+' : ''}${Math.abs(dot.amount).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </span>
+            )}
+            {dot.phasePct !== undefined && dot.phasePct !== 0 && (
+              <span className={`ml-1 text-[9px] px-1 rounded ${dot.phasePct < 0 ? 'bg-red-100 text-red-600' : 'bg-green-100 text-green-600'}`}>
+                {dot.phasePct > 0 ? '+' : ''}{dot.phasePct}%
+              </span>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 const CustomTooltip = ({
   active,
   payload,
   label,
   formatType = 'auto',
+  operationDots,
 }: {
   active?: boolean
   payload?: { name: string; value: number; color: string }[]
   label?: string
   formatType?: 'currency' | 'percent' | 'number' | 'auto'
+  operationDots?: Map<string, OperationDot[]>
 }) => {
   if (active && payload && payload.length) {
     const filteredPayload = (payload as { name: string; value: number; color: string }[]).filter(
@@ -101,8 +190,11 @@ const CustomTooltip = ({
     )
     if (filteredPayload.length === 0) return null
 
+    // 获取当前 date 的操作点
+    const dots: OperationDot[] = (label ? operationDots?.get(label) : undefined) ?? []
+
     return (
-      <div className="bg-white p-3 border border-slate-200 shadow-lg rounded-lg text-xs">
+      <div className="bg-white p-3 border border-slate-200 shadow-xl rounded-xl text-xs" style={{ maxWidth: 340, zIndex: 9999 }}>
         <p className="font-bold text-slate-700 mb-2">{label}</p>
         {filteredPayload.map((p) => {
           let formattedValue = ''
@@ -115,32 +207,28 @@ const CustomTooltip = ({
           } else if (formatType === 'number') {
             formattedValue = val.toFixed(2)
           } else {
-            // auto mode (legacy/fallback)
             const lowerName = p.name.toLowerCase()
-            if (
-              lowerName.includes('%') ||
-              lowerName.includes('ltv') ||
-              lowerName.includes('drawdown')
-            ) {
+            if (lowerName.includes('%') || lowerName.includes('ltv') || lowerName.includes('drawdown')) {
               formattedValue = `${val.toFixed(2)}%`
             } else if (lowerName.includes('beta') || lowerName.includes('ratio')) {
               formattedValue = val.toFixed(2)
             } else if (lowerName.includes('cashamount') || lowerName.includes('balance')) {
               formattedValue = `$${val.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
             } else {
-              // Fallback for mixed charts like Cash Allocation
               formattedValue = val.toLocaleString()
             }
           }
 
           return (
             <div key={p.name} className="flex items-center gap-2 mb-1" style={{ color: p.color }}>
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: p.color }}></span>
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: p.color }} />
               <span>{p.name}:</span>
               <span className="font-mono font-bold">{formattedValue}</span>
             </div>
           )
         })}
+        {/* 操作明细区域（PRD §3.3） */}
+        <OperationTooltipSection dots={dots} />
       </div>
     )
   }
@@ -187,6 +275,8 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
   }
   const [showMath, setShowMath] = useState(false)
   const [isGeneratingReport, setIsGeneratingReport] = useState(false)
+  // PRD C6：操作标注点总开关
+  const [showDots, setShowDots] = useState(true)
   const [sortConfig, setSortConfig] = useState<{
     key: keyof SimulationResult['metrics'] | 'strategyName'
     direction: 'asc' | 'desc'
@@ -452,6 +542,59 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
     })
   }, [results, sortConfig])
 
+  // 操作点数据聚合（PRD §3.5）
+  const operationDots = useMemo(() => {
+    const dotsMap = new Map<string, OperationDot[]>()
+    chartResults.forEach((res) => {
+      res.history.forEach((state) => {
+        const dateKey = state.date
+        if (!state.events || state.events.length === 0) return
+
+        // 过滤有意义的事件
+        const significantEvents = state.events.filter(
+          (e) => e.type !== 'INTEREST_INC' && e.type !== 'ALERT_SENT'
+        )
+        if (significantEvents.length === 0) return
+
+        if (!dotsMap.has(dateKey)) dotsMap.set(dateKey, [])
+        const existing = dotsMap.get(dateKey)!
+
+        for (const evt of significantEvents) {
+          existing.push({
+            date: dateKey,
+            type: evt.type,
+            color: DOT_COLOR[evt.type] ?? '#94a3b8',
+            r: DOT_RADIUS[evt.type] ?? 3,
+            strategyName: res.strategyName,
+            strategyColor: res.color,
+            totalValue: state.totalValue,
+            description: evt.description,
+            amount: evt.amount,
+            phasePct: evt.phasePct,
+          })
+        }
+      })
+    })
+    return dotsMap
+  }, [chartResults])
+
+  // 每个日期的主要标注点（按优先级选出一个，PRD §3.2）
+  const primaryDots = useMemo(() => {
+    const result: Array<{ date: string; dot: OperationDot; totalValue: number }> = []
+    operationDots.forEach((dots, date) => {
+      // 按优先级排序，选出每个 date 的主要标注点
+      const sorted = [...dots].sort(
+        (a, b) => (DOT_PRIORITY[a.type] ?? 99) - (DOT_PRIORITY[b.type] ?? 99)
+      )
+      const top = sorted[0]
+      if (top) {
+        // 找到该日期第一个策略的净值作为 Y 坐标
+        result.push({ date, dot: top, totalValue: top.totalValue })
+      }
+    })
+    return result
+  }, [operationDots])
+
   const handleDownloadReport = async () => {
     setIsGeneratingReport(true)
     try {
@@ -525,6 +668,20 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
             )}
           </div>
           <div className="flex items-center gap-2">
+            {/* PRD C6：标注点总开关 */}
+            <button
+              onClick={() => setShowDots(!showDots)}
+              className={clsx(
+                'flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all rounded-lg border shadow-sm active:scale-95',
+                showDots
+                  ? 'bg-indigo-50 text-indigo-600 border-indigo-200 hover:bg-indigo-100'
+                  : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50',
+              )}
+              title="显示/隐藏操作标注点"
+            >
+              {showDots ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+              <span className="hidden sm:inline">标注点</span>
+            </button>
             <button
               onClick={() => setIsSelectionMode(!isSelectionMode)}
               className={clsx(
@@ -591,9 +748,9 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                 interval={0}
                 allowDataOverflow={true}
               />
-              <Tooltip content={<CustomTooltip formatType="currency" />} />
+              <Tooltip content={<CustomTooltip formatType="currency" operationDots={operationDots} />} />
               <Legend />
-              {/* Hidden anchor line to force Y-axis domain */}
+              {/* 隐藏锤点用于强制 Y 轴 domain */}
               <Line
                 dataKey="_yAnchor"
                 stroke="none"
@@ -611,6 +768,19 @@ export const ResultsDashboard: React.FC<ResultsDashboardProps> = ({ results }) =
                   fillOpacity={0.1}
                 />
               )}
+              {/* 操作标注点（PRD §3.2） */}
+              {showDots && primaryDots.map(({ date, dot, totalValue }) => (
+                <ReferenceDot
+                  key={`${date}-${dot.strategyName}`}
+                  x={date}
+                  y={totalValue}
+                  r={dot.r}
+                  fill={dot.color}
+                  stroke="white"
+                  strokeWidth={1.5}
+                  ifOverflow="extendDomain"
+                />
+              ))}
               {chartResults.map((res) => {
                 const isBenchmark = res.strategyName.toLowerCase().includes('benchmark')
                 return (
